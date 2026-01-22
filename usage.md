@@ -150,6 +150,7 @@ begin
   as_xlsx.save( 'MY_DIR', 'my.xlsx', 'demo' );
 end;
 ~~~
+~~~
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
@@ -170,3 +171,5 @@ begin
   as_xlsx.num_formula( 1, 6, 'SUM(A1:A2)' );
   as_xlsx.save( 'MY_DIR', 'my.xlsx' );
 end;
+~~~
+
