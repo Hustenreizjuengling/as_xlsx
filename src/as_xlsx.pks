@@ -86,6 +86,9 @@ is
 **     added formulas again
 **   Date: 14-08-2025
 **     added rotation
+**   Date: 01-03-2026
+**     Refactored to write-only package, removed read/file-I/O,
+**     split finish() into modular sub-procedures
 ******************************************************************************
 ******************************************************************************
 Copyright (C) 2011, 2025 by Anton Scheffer
@@ -111,7 +114,6 @@ THE SOFTWARE.
 ******************************************************************************
 ******************************************** */
 --
-  use_utl_file    constant boolean := true;
   use_dbms_crypto constant boolean := false;
   --
   type tp_alignment is record
@@ -120,22 +122,6 @@ THE SOFTWARE.
     , wrapText   boolean
     , rotation   number
     );
-  type sheet_names is table of varchar2(4000);
-  type tp_one_cell is record
-    ( sheet_nr number(2)
-    , sheet_name varchar(4000)
-    , row_nr number(10)
-    , col_nr number(10)
-    , cell varchar2(100)
-    , cell_type varchar2(1)
-    , string_val varchar2(4000)
-    , number_val number
-    , date_val date
-    , formula varchar2(4000)
-    , clob_val clob
-    , string_len integer
-  );
-  type tp_all_cells is table of tp_one_cell;
 --
   procedure clear_workbook;
 --
@@ -477,17 +463,10 @@ top
   function finish( p_password varchar2  := null )
   return blob;
 --
-  procedure save
-    ( p_directory varchar2
-    , p_filename varchar2
-    , p_password varchar2 := null
-    );
   --
   procedure query2sheet
     ( p_sql            varchar2
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -502,8 +481,6 @@ top
   procedure query2sheet
     ( p_rc             in out sys_refcursor
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -518,8 +495,6 @@ top
   function query2sheet
     ( p_sql            varchar2
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -535,8 +510,6 @@ top
   function query2sheet
     ( p_rc             in out sys_refcursor
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -568,20 +541,6 @@ and even then I'm not sure if it will display an image :)
     , p_height pls_integer := null
     );
   --
-  function read
-    ( p_xlsx           blob
-    , p_sheets         varchar2 := null
-    , p_cell           varchar2 := null
-    , p_include_clobs  varchar2 := null
-    , p_add_empty_cols varchar2 := null
-    )
-  return tp_all_cells pipelined;
-  --
-  function get_sheet_names( p_xlsx blob )
-  return sheet_names;
-  --
-  function file2blob( p_dir varchar2, p_file_name varchar2 )
-  return blob;
   --
   function get_version
   return varchar2;

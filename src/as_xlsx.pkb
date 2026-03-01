@@ -1,7 +1,7 @@
 create or replace package body as_xlsx
 is
   --
-  c_version constant varchar2(20) := 'as_xlsx50';
+  c_version constant varchar2(20) := 'as_xlsx60';
 --
   c_lob_duration constant pls_integer := dbms_lob.call;
   c_LOCAL_FILE_HEADER        constant raw(4) := hextoraw( '504B0304' ); -- Local file header signature
@@ -171,30 +171,6 @@ is
     );
   workbook tp_book;
   --
-  type tp_zip_info is record
-    ( len integer
-    , cnt integer
-    , len_cd integer
-    , idx_cd integer
-    , idx_eocd integer
-    );
-  type tp_cfh is record
-    ( offset integer
-    , compressed_len integer
-    , original_len integer
-    , len pls_integer
-    , n   pls_integer
-    , m   pls_integer
-    , k   pls_integer
-    , utf8 boolean
-    , encrypted boolean
-    , crc32 raw(4)
-    , external_file_attr raw(4)
-    , encoding varchar2(3999)
-    , idx   integer
-    , name1 raw(32767)
-    );
-  --
   g_useXf boolean := true;
   --
   g_addtxt2utf8blob_tmp varchar2(32767);
@@ -229,43 +205,6 @@ is
       g_addtxt2utf8blob_tmp := p_txt;
   end;
 --
-  procedure blob2file
-    ( p_blob blob
-    , p_directory varchar2 := 'MY_DIR'
-    , p_filename varchar2 := 'my.xlsx'
-    )
-  is
-$IF as_xlsx.use_utl_file
-$THEN
-    t_fh utl_file.file_type;
-    t_len pls_integer := 32767;
-  begin
-    t_fh := utl_file.fopen( p_directory
-                          , p_filename
-                          , 'wb'
-                          );
-    for i in 0 .. trunc( ( dbms_lob.getlength( p_blob ) - 1 ) / t_len )
-    loop
-      utl_file.put_raw( t_fh
-                      , dbms_lob.substr( p_blob
-                                       , t_len
-                                       , i * t_len + 1
-                                       )
-                      );
-    end loop;
-    utl_file.fclose( t_fh );
-$ELSE
-  begin
-    raise_application_error( -20024, 'utl_file not available. Change the package header, set as_xlsx.use_utl_file := true; when you have access to utl_file.' );
-$END
-  end;
---
-  function raw2num( p_raw raw, p_len integer, p_pos integer )
-  return number
-  is
-  begin
-    return utl_raw.cast_to_binary_integer( utl_raw.substr( p_raw, p_pos, p_len ), utl_raw.little_endian );
-  end;
 --
   function little_endian( p_big number, p_bytes pls_integer := 4 )
   return raw
@@ -277,13 +216,6 @@ $END
     else
       return utl_raw.reverse( to_char( p_big, substr( 'fm0XXXXXXXXXXXXXXXXXXX', 1, 2 + 2 * p_bytes ) ) );
     end if;
-  end;
-  --
-  function little_endian( p_num raw, p_pos pls_integer := 1, p_bytes pls_integer := null )
-  return integer
-  is
-  begin
-    return to_number( utl_raw.reverse( utl_raw.substr( p_num, p_pos, p_bytes ) ), 'XXXXXXXXXXXXXXXX' );
   end;
   --
   function blob2num( p_blob blob, p_len integer, p_pos integer )
@@ -437,15 +369,6 @@ $END
            end;
   end;
   --
-  function col_alfan( p_col varchar2 )
-  return pls_integer
-  is
-    l_col varchar2(1000) := rtrim( p_col, '0123456789' );
-  begin
-    return ascii( substr( l_col, -1 ) ) - 64
-         + nvl( ( ascii( substr( l_col, -2, 1 ) ) - 64 ) * 26, 0 )
-         + nvl( ( ascii( substr( l_col, -3, 1 ) ) - 64 ) * 676, 0 );
-  end;
   --
   procedure clear_workbook
   is
@@ -487,6 +410,7 @@ $END
       dbms_lob.freetemporary( workbook.images(i).img );
     end loop;
     workbook.images.delete;
+    authors.delete;
     workbook := null;
   end;
 --
@@ -1334,26 +1258,6 @@ $END
     workbook.tables( t_cnt ) := t_table;
   end;
 --
-/*
-  procedure add1xml
-    ( p_excel in out nocopy blob
-    , p_filename varchar2
-    , p_xml clob
-    )
-  is
-    t_tmp blob;
-    c_step constant number := 24396;
-  begin
-    dbms_lob.createtemporary( t_tmp, true );
-    for i in 0 .. trunc( length( p_xml ) / c_step )
-    loop
-      dbms_lob.append( t_tmp, utl_i18n.string_to_raw( substr( p_xml, i * c_step + 1, c_step ), 'AL32UTF8' ) );
-    end loop;
-    add1file( p_excel, p_filename, t_tmp );
-    dbms_lob.freetemporary( t_tmp );
-  end;
-*/
---
   procedure add1xml
     ( p_excel in out nocopy blob
     , p_filename varchar2
@@ -1954,120 +1858,112 @@ $THEN
   end excel_encrypt;
 $END
   --
-  function finish( p_password varchar2 := null )
-  return blob
+  procedure build_content_types( p_excel in out nocopy blob )
   is
-    t_excel blob;
-    t_yyy blob;
-    t_xxx clob;
-    t_c number;
-    t_h number;
-    t_w number;
-    t_cw number;
-    s pls_integer;
-    t_row_ind pls_integer;
-    t_col_min pls_integer;
-    t_col_max pls_integer;
-    t_col_ind pls_integer;
-    t_len pls_integer;
+    l_xxx clob;
+    l_s pls_integer;
   begin
-    dbms_lob.createtemporary( t_excel, true );
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 <Default Extension="xml" ContentType="application/xml"/>
 <Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>
 <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>';
-    s := workbook.sheets.first;
-    while s is not null
+    l_s := workbook.sheets.first;
+    while l_s is not null
     loop
-      t_xxx := t_xxx || ( '
-<Override PartName="/xl/worksheets/sheet' || s || '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' );
-      s := workbook.sheets.next( s );
+      l_xxx := l_xxx || ( '
+<Override PartName="/xl/worksheets/sheet' || l_s || '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' );
+      l_s := workbook.sheets.next( l_s );
     end loop;
-    t_xxx := t_xxx || '
+    l_xxx := l_xxx || '
 <Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
 <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
 <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
 <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
 <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>';
-    s := workbook.sheets.first;
-    while s is not null
+    l_s := workbook.sheets.first;
+    while l_s is not null
     loop
-      if workbook.sheets( s ).comments.count > 0
+      if workbook.sheets( l_s ).comments.count > 0
       then
-        t_xxx := t_xxx || ( '
-<Override PartName="/xl/comments' || s || '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>' );
+        l_xxx := l_xxx || ( '
+<Override PartName="/xl/comments' || l_s || '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>' );
       end if;
-      if workbook.sheets( s ).drawings.count > 0
+      if workbook.sheets( l_s ).drawings.count > 0
       then
-        t_xxx := t_xxx || ( '
-<Override ContentType="application/vnd.openxmlformats-officedocument.drawing+xml" PartName="/xl/drawings/drawing' || s || '.xml"/>' );
+        l_xxx := l_xxx || ( '
+<Override ContentType="application/vnd.openxmlformats-officedocument.drawing+xml" PartName="/xl/drawings/drawing' || l_s || '.xml"/>' );
       end if;
-      s := workbook.sheets.next( s );
+      l_s := workbook.sheets.next( l_s );
     end loop;
     if workbook.images.count > 0
     then
-      t_xxx := t_xxx || '
+      l_xxx := l_xxx || '
 <Default ContentType="image/png" Extension="png"/>';
     end if;
     for i in 1 .. workbook.tables.count
     loop
-      t_xxx := t_xxx || ( '
+      l_xxx := l_xxx || ( '
 <Override PartName="/xl/tables/table' || to_char(i) || '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>' );
     end loop;
-    t_xxx := t_xxx || '
+    l_xxx := l_xxx || '
 </Types>';
-    add1xml( t_excel, '[Content_Types].xml', t_xxx );
-    --
-    declare
-      l_name  varchar2(32767);
-      l_ref   varchar2(100);
-      l_row   tp_cells;
-      l_table tp_table;
-      type tp_test is table of varchar2(32767);
-      l_test  tp_test;
-    begin
-      for i in 1 .. workbook.tables.count
+    add1xml( p_excel, '[Content_Types].xml', l_xxx );
+  end build_content_types;
+  --
+  procedure build_tables( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+    l_name  varchar2(32767);
+    l_ref   varchar2(100);
+    l_row   tp_cells;
+    l_table tp_table;
+    type tp_test is table of varchar2(32767);
+    l_test  tp_test;
+  begin
+    for i in 1 .. workbook.tables.count
+    loop
+      l_table := workbook.tables( i );
+      l_ref := '"' || alfan_col( l_table.column_start ) || l_table.row_start ||
+               ':' || alfan_col( l_table.column_end ) || l_table.row_end || '"';
+      l_xxx := ( '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' ||
+                 '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"' ||
+                 ' id="' || to_char( i ) || '"' ||
+                 ' name="' || l_table.name || '"' ||
+                 ' displayName="' || l_table.name || '"' ||
+                 ' ref=' || l_ref ||
+                 ' totalsRowShown="0">' ||
+                 '<autoFilter ref=' || l_ref || '/>' ||
+                 '<tableColumns count="' || to_char( 1 + l_table.column_end - l_table.column_start ) || '">'
+               );
+      l_test := tp_test();
+      l_row := workbook.sheets( l_table.sheet ).rows( l_table.row_start );
+      for j in l_table.column_start .. l_table.column_end
       loop
-        l_table := workbook.tables( i );
-        l_ref := '"' || alfan_col( l_table.column_start ) || l_table.row_start ||
-                 ':' || alfan_col( l_table.column_end ) || l_table.row_end || '"';
-        t_xxx := ( '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' ||
-                   '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"' ||
-                   ' id="' || to_char( i ) || '"' ||
-                   ' name="' || l_table.name || '"' ||
-                   ' displayName="' || l_table.name || '"' ||
-                   ' ref=' || l_ref ||
-                   ' totalsRowShown="0">' ||
-                   '<autoFilter ref=' || l_ref || '/>' ||
-                   '<tableColumns count="' || to_char( 1 + l_table.column_end - l_table.column_start ) || '">'
-                 );
-        --
-        l_test := tp_test();
-        l_row := workbook.sheets( l_table.sheet ).rows( l_table.row_start );
-        for j in l_table.column_start .. l_table.column_end
-        loop
-          l_name := workbook.str_ind( l_row( j ).value );
-          if l_name member of l_test
-          then
-            raise_application_error( -20010, 'Table Header "' || l_name || '" appears multiple times in Table "' || l_table.name || '"' );
-          end if;
-          l_test := l_test multiset union tp_test( l_name );
-          t_xxx := t_xxx || ( '<tableColumn id="' || to_char( j ) || '" name="' || l_name || '"/>' );
-        end loop;
-        --
-        t_xxx := t_xxx || ( '</tableColumns>' ||
-                            '<tableStyleInfo name="' || l_table.style || '"' ||
-                            ' showFirstColumn="0" showLastColumn="0"' ||
-                            ' showRowStripes="1" showColumnStripes="0"' ||
-                            '/></table>'
-                          );
-        add1xml( t_excel, 'xl/tables/table' || to_char(i) || '.xml', t_xxx );
+        l_name := workbook.str_ind( l_row( j ).value );
+        if l_name member of l_test
+        then
+          raise_application_error( -20010, 'Table Header "' || l_name || '" appears multiple times in Table "' || l_table.name || '"' );
+        end if;
+        l_test := l_test multiset union tp_test( l_name );
+        l_xxx := l_xxx || ( '<tableColumn id="' || to_char( j ) || '" name="' || l_name || '"/>' );
       end loop;
-    end;
-    --
-    t_xxx := ( '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+      l_xxx := l_xxx || ( '</tableColumns>' ||
+                          '<tableStyleInfo name="' || l_table.style || '"' ||
+                          ' showFirstColumn="0" showLastColumn="0"' ||
+                          ' showRowStripes="1" showColumnStripes="0"' ||
+                          '/></table>'
+                        );
+      add1xml( p_excel, 'xl/tables/table' || to_char(i) || '.xml', l_xxx );
+    end loop;
+  end build_tables;
+  --
+  procedure build_core_properties( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+  begin
+    l_xxx := ( '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 <dc:creator>' || sys_context( 'userenv', 'os_user' ) || '</dc:creator>
 <dc:description>Build by version:' || c_version || '</dc:description>
@@ -2075,8 +1971,15 @@ $END
 <dcterms:created xsi:type="dcterms:W3CDTF">' || to_char( current_timestamp, 'yyyy-mm-dd"T"hh24:mi:ssTZH:TZM' ) || '</dcterms:created>
 <dcterms:modified xsi:type="dcterms:W3CDTF">' || to_char( current_timestamp, 'yyyy-mm-dd"T"hh24:mi:ssTZH:TZM' ) || '</dcterms:modified>
 </cp:coreProperties>' );
-    add1xml( t_excel, 'docProps/core.xml', t_xxx );
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    add1xml( p_excel, 'docProps/core.xml', l_xxx );
+  end build_core_properties;
+  --
+  procedure build_app_properties( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+    l_s pls_integer;
+  begin
+    l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
 <Application>Microsoft Excel</Application>
 <DocSecurity>0</DocSecurity>
@@ -2093,43 +1996,55 @@ $END
 </HeadingPairs>
 <TitlesOfParts>
 <vt:vector size="' || workbook.sheets.count || '" baseType="lpstr">';
-    s := workbook.sheets.first;
-    while s is not null
+    l_s := workbook.sheets.first;
+    while l_s is not null
     loop
-      t_xxx := t_xxx || ( '
-<vt:lpstr>' || workbook.sheets( s ).name || '</vt:lpstr>' );
-      s := workbook.sheets.next( s );
+      l_xxx := l_xxx || ( '
+<vt:lpstr>' || workbook.sheets( l_s ).name || '</vt:lpstr>' );
+      l_s := workbook.sheets.next( l_s );
     end loop;
-    t_xxx := t_xxx || '</vt:vector>
+    l_xxx := l_xxx || '</vt:vector>
 </TitlesOfParts>
 <LinksUpToDate>false</LinksUpToDate>
 <SharedDoc>false</SharedDoc>
 <HyperlinksChanged>false</HyperlinksChanged>
 <AppVersion>14.0300</AppVersion>
 </Properties>';
-    add1xml( t_excel, 'docProps/app.xml', t_xxx );
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    add1xml( p_excel, 'docProps/app.xml', l_xxx );
+  end build_app_properties;
+  --
+  procedure build_relationships( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+  begin
+    l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
 <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>';
-    add1xml( t_excel, '_rels/.rels', t_xxx );
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    add1xml( p_excel, '_rels/.rels', l_xxx );
+  end build_relationships;
+  --
+  procedure build_styles( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+  begin
+    l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x14ac" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac">';
     if workbook.numFmts.count > 0
     then
-      t_xxx := t_xxx || ( '<numFmts count="' || workbook.numFmts.count || '">' );
+      l_xxx := l_xxx || ( '<numFmts count="' || workbook.numFmts.count || '">' );
       for n in 1 .. workbook.numFmts.count
       loop
-        t_xxx := t_xxx || ( '<numFmt numFmtId="' || workbook.numFmts( n ).numFmtId || '" formatCode="' || workbook.numFmts( n ).formatCode || '"/>' );
+        l_xxx := l_xxx || ( '<numFmt numFmtId="' || workbook.numFmts( n ).numFmtId || '" formatCode="' || workbook.numFmts( n ).formatCode || '"/>' );
       end loop;
-      t_xxx := t_xxx || '</numFmts>';
+      l_xxx := l_xxx || '</numFmts>';
     end if;
-    t_xxx := t_xxx || ( '<fonts count="' || workbook.fonts.count || '" x14ac:knownFonts="1">' );
+    l_xxx := l_xxx || ( '<fonts count="' || workbook.fonts.count || '" x14ac:knownFonts="1">' );
     for f in 0 .. workbook.fonts.count - 1
     loop
-      t_xxx := t_xxx || ( '<font>' ||
+      l_xxx := l_xxx || ( '<font>' ||
         case when workbook.fonts( f ).bold then '<b/>' end ||
         case when workbook.fonts( f ).italic then '<i/>' end ||
         case when workbook.fonts( f ).underline then '<u/>' end ||
@@ -2143,26 +2058,26 @@ $END
 <scheme val="none"/>
 </font>' );
     end loop;
-    t_xxx := t_xxx || ( '</fonts>
+    l_xxx := l_xxx || ( '</fonts>
 <fills count="' || workbook.fills.count || '">' );
     for f in 0 .. workbook.fills.count - 1
     loop
-      t_xxx := t_xxx || ( '<fill><patternFill patternType="' || workbook.fills( f ).patternType || '">' ||
+      l_xxx := l_xxx || ( '<fill><patternFill patternType="' || workbook.fills( f ).patternType || '">' ||
          add_rgb( workbook.fills( f ).fgRGB, 'fgColor' ) ||
          '</patternFill></fill>' );
     end loop;
-    t_xxx := t_xxx || ( '</fills>
+    l_xxx := l_xxx || ( '</fills>
 <borders count="' || workbook.borders.count || '">' );
     for b in 0 .. workbook.borders.count - 1
     loop
-      t_xxx := t_xxx || ( '<border>' ||
+      l_xxx := l_xxx || ( '<border>' ||
          case when workbook.borders( b ).left   is null then '<left/>'   else '<left style="'   || workbook.borders( b ).left   || '">' || add_rgb( workbook.borders( b ).rgb ) || '</left>' end ||
          case when workbook.borders( b ).right  is null then '<right/>'  else '<right style="'  || workbook.borders( b ).right  || '">' || add_rgb( workbook.borders( b ).rgb ) || '</right>' end ||
          case when workbook.borders( b ).top    is null then '<top/>'    else '<top style="'    || workbook.borders( b ).top    || '">' || add_rgb( workbook.borders( b ).rgb ) || '</top>' end ||
          case when workbook.borders( b ).bottom is null then '<bottom/>' else '<bottom style="' || workbook.borders( b ).bottom || '">' || add_rgb( workbook.borders( b ).rgb ) || '</bottom>' end ||
          '</border>' );
     end loop;
-    t_xxx := t_xxx || ( '</borders>
+    l_xxx := l_xxx || ( '</borders>
 <cellStyleXfs count="1">
 <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
 </cellStyleXfs>
@@ -2170,22 +2085,22 @@ $END
 <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' );
     for x in 1 .. workbook.cellXfs.count
     loop
-      t_xxx := t_xxx || ( '<xf numFmtId="' || workbook.cellXfs( x ).numFmtId || '" fontId="' || workbook.cellXfs( x ).fontId || '" fillId="' || workbook.cellXfs( x ).fillId || '" borderId="' || workbook.cellXfs( x ).borderId || '">' );
+      l_xxx := l_xxx || ( '<xf numFmtId="' || workbook.cellXfs( x ).numFmtId || '" fontId="' || workbook.cellXfs( x ).fontId || '" fillId="' || workbook.cellXfs( x ).fillId || '" borderId="' || workbook.cellXfs( x ).borderId || '">' );
       if (  workbook.cellXfs( x ).alignment.horizontal is not null
          or workbook.cellXfs( x ).alignment.vertical is not null
          or workbook.cellXfs( x ).alignment.wrapText
          or workbook.cellXfs( x ).alignment.rotation is not null
          )
       then
-        t_xxx := t_xxx || ( '<alignment' ||
+        l_xxx := l_xxx || ( '<alignment' ||
           case when workbook.cellXfs( x ).alignment.horizontal is not null then ' horizontal="' || workbook.cellXfs( x ).alignment.horizontal || '"' end ||
           case when workbook.cellXfs( x ).alignment.vertical is not null then ' vertical="' || workbook.cellXfs( x ).alignment.vertical || '"' end ||
           case when workbook.cellXfs( x ).alignment.rotation is not null then ' textRotation="' || round( workbook.cellXfs( x ).alignment.rotation ) || '"' end ||
           case when workbook.cellXfs( x ).alignment.wrapText then ' wrapText="true"' end || '/>' );
       end if;
-      t_xxx := t_xxx || '</xf>';
+      l_xxx := l_xxx || '</xf>';
     end loop;
-    t_xxx := t_xxx || ( '</cellXfs>
+    l_xxx := l_xxx || ( '</cellXfs>
 <cellStyles count="1">
 <cellStyle name="Normal" xfId="0" builtinId="0"/>
 </cellStyles>
@@ -2197,8 +2112,15 @@ $END
 </ext>
 </extLst>
 </styleSheet>' );
-    add1xml( t_excel, 'xl/styles.xml', t_xxx );
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    add1xml( p_excel, 'xl/styles.xml', l_xxx );
+  end build_styles;
+  --
+  procedure build_workbook( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+    l_s pls_integer;
+  begin
+    l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
 <fileVersion appName="xl" lastEdited="5" lowestEdited="5" rupBuild="9302"/>
 <workbookPr defaultThemeVersion="124226"/>
@@ -2206,29 +2128,32 @@ $END
 <workbookView xWindow="120" yWindow="45" windowWidth="19155" windowHeight="4935"/>
 </bookViews>
 <sheets>';
-    s := workbook.sheets.first;
-    while s is not null
+    l_s := workbook.sheets.first;
+    while l_s is not null
     loop
-      t_xxx := t_xxx || ( '
-<sheet name="' || workbook.sheets( s ).name || '" sheetId="' || s || '" r:id="rId' || ( 9 + s ) || '"/>' );
-      s := workbook.sheets.next( s );
+      l_xxx := l_xxx || ( '
+<sheet name="' || workbook.sheets( l_s ).name || '" sheetId="' || l_s || '" r:id="rId' || ( 9 + l_s ) || '"/>' );
+      l_s := workbook.sheets.next( l_s );
     end loop;
-    t_xxx := t_xxx || '</sheets>';
+    l_xxx := l_xxx || '</sheets>';
     if workbook.defined_names.count > 0
     then
-      t_xxx := t_xxx || '<definedNames>';
-      for s in 1 .. workbook.defined_names.count
+      l_xxx := l_xxx || '<definedNames>';
+      for l_s in 1 .. workbook.defined_names.count
       loop
-        t_xxx := t_xxx || ( '
-<definedName name="' || workbook.defined_names( s ).name || '"' ||
-            case when workbook.defined_names( s ).sheet is not null then ' localSheetId="' || to_char( workbook.defined_names( s ).sheet ) || '"' end ||
-            '>' || workbook.defined_names( s ).ref || '</definedName>' );
+        l_xxx := l_xxx || ( '
+<definedName name="' || workbook.defined_names( l_s ).name || '"' ||
+            case when workbook.defined_names( l_s ).sheet is not null then ' localSheetId="' || to_char( workbook.defined_names( l_s ).sheet ) || '"' end ||
+            '>' || workbook.defined_names( l_s ).ref || '</definedName>' );
       end loop;
-      t_xxx := t_xxx || '</definedNames>';
+      l_xxx := l_xxx || '</definedNames>';
     end if;
-    t_xxx := t_xxx || '<calcPr calcId="144525"/></workbook>';
-    add1xml( t_excel, 'xl/workbook.xml', t_xxx );
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    l_xxx := l_xxx || '<calcPr calcId="144525"/></workbook>';
+    add1xml( p_excel, 'xl/workbook.xml', l_xxx );
+  end build_workbook;
+  --
+  -- Theme XML constant
+  c_THEME_XML constant clob := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
 <a:themeElements>
 <a:clrScheme name="Office">
@@ -2511,190 +2436,210 @@ $END
 <a:objectDefaults/>
 <a:extraClrSchemeLst/>
 </a:theme>';
-    add1xml( t_excel, 'xl/theme/theme1.xml', t_xxx );
-    s := workbook.sheets.first;
-    while s is not null
+  --
+  procedure build_theme( p_excel in out nocopy blob )
+  is
+  begin
+    add1xml( p_excel, 'xl/theme/theme1.xml', c_THEME_XML );
+  end build_theme;
+  --
+  procedure build_worksheets( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+    l_yyy blob;
+    l_c number;
+    l_h number;
+    l_w number;
+    l_cw number;
+    l_s pls_integer;
+    l_row_ind pls_integer;
+    l_col_min pls_integer;
+    l_col_max pls_integer;
+    l_col_ind pls_integer;
+  begin
+    l_s := workbook.sheets.first;
+    while l_s is not null
     loop
-      t_col_min := 16384;
-      t_col_max := 1;
-      t_row_ind := workbook.sheets( s ).rows.first;
-      while t_row_ind is not null
+      l_col_min := 16384;
+      l_col_max := 1;
+      l_row_ind := workbook.sheets( l_s ).rows.first;
+      while l_row_ind is not null
       loop
-        t_col_min := least( t_col_min, nvl( workbook.sheets( s ).rows( t_row_ind ).first, t_col_min ) );
-        t_col_max := greatest( t_col_max, nvl( workbook.sheets( s ).rows( t_row_ind ).last, t_col_max ) );
-        t_row_ind := workbook.sheets( s ).rows.next( t_row_ind );
+        l_col_min := least( l_col_min, nvl( workbook.sheets( l_s ).rows( l_row_ind ).first, l_col_min ) );
+        l_col_max := greatest( l_col_max, nvl( workbook.sheets( l_s ).rows( l_row_ind ).last, l_col_max ) );
+        l_row_ind := workbook.sheets( l_s ).rows.next( l_row_ind );
       end loop;
-      if t_col_min = 16384
+      if l_col_min = 16384
       then -- no "cell" in sheet, only images for instance see https://github.com/antonscheffer/as_xlsx/issues/23
-        t_col_min := t_col_max;
+        l_col_min := l_col_max;
       end if;
-      addtxt2utf8blob_init( t_yyy );
+      addtxt2utf8blob_init( l_yyy );
       addtxt2utf8blob( '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x14ac" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac">' ||
-case when workbook.sheets( s ).tabcolor is not null then '<sheetPr>' || add_rgb( workbook.sheets( s ).tabcolor, 'tabColor' ) || '</sheetPr>' end ||
-'<dimension ref="' || alfan_col( t_col_min ) || workbook.sheets( s ).rows.first || ':' || alfan_col( t_col_max ) || workbook.sheets( s ).rows.last || '"/>
+case when workbook.sheets( l_s ).tabcolor is not null then '<sheetPr>' || add_rgb( workbook.sheets( l_s ).tabcolor, 'tabColor' ) || '</sheetPr>' end ||
+'<dimension ref="' || alfan_col( l_col_min ) || workbook.sheets( l_s ).rows.first || ':' || alfan_col( l_col_max ) || workbook.sheets( l_s ).rows.last || '"/>
 <sheetViews>
 <sheetView' ||
-  case when workbook.sheets( s ).grid_color_idx is not null then ' defaultGridColor="0" colorId="' || to_char( workbook.sheets( s ).grid_color_idx ) || '"' end ||
-  case when not workbook.sheets( s ).show_gridlines then ' showGridLines="0"' end ||
-  case when not workbook.sheets( s ).show_headers then ' showRowColHeaders="0"' end ||
-  case when s = 1 then ' tabSelected="1"' end || ' workbookViewId="0">'
-                     , t_yyy
+  case when workbook.sheets( l_s ).grid_color_idx is not null then ' defaultGridColor="0" colorId="' || to_char( workbook.sheets( l_s ).grid_color_idx ) || '"' end ||
+  case when not workbook.sheets( l_s ).show_gridlines then ' showGridLines="0"' end ||
+  case when not workbook.sheets( l_s ).show_headers then ' showRowColHeaders="0"' end ||
+  case when l_s = 1 then ' tabSelected="1"' end || ' workbookViewId="0">'
+                     , l_yyy
                      );
-      if workbook.sheets( s ).freeze_rows > 0 and workbook.sheets( s ).freeze_cols > 0
+      if workbook.sheets( l_s ).freeze_rows > 0 and workbook.sheets( l_s ).freeze_cols > 0
       then
-        addtxt2utf8blob( '<pane xSplit="' || workbook.sheets( s ).freeze_cols || '" '
-                          || 'ySplit="' || workbook.sheets( s ).freeze_rows || '" '
-                          || 'topLeftCell="' || alfan_col( workbook.sheets( s ).freeze_cols + 1 ) || ( workbook.sheets( s ).freeze_rows + 1 ) || '" '
+        addtxt2utf8blob( '<pane xSplit="' || workbook.sheets( l_s ).freeze_cols || '" '
+                          || 'ySplit="' || workbook.sheets( l_s ).freeze_rows || '" '
+                          || 'topLeftCell="' || alfan_col( workbook.sheets( l_s ).freeze_cols + 1 ) || ( workbook.sheets( l_s ).freeze_rows + 1 ) || '" '
                           || 'activePane="bottomLeft" state="frozen"/>'
-                       , t_yyy
+                       , l_yyy
                        );
       else
-        if workbook.sheets( s ).freeze_rows > 0
+        if workbook.sheets( l_s ).freeze_rows > 0
         then
-          addtxt2utf8blob( '<pane ySplit="' || workbook.sheets( s ).freeze_rows || '" topLeftCell="A' || ( workbook.sheets( s ).freeze_rows + 1 ) || '" activePane="bottomLeft" state="frozen"/>'
-                         , t_yyy
+          addtxt2utf8blob( '<pane ySplit="' || workbook.sheets( l_s ).freeze_rows || '" topLeftCell="A' || ( workbook.sheets( l_s ).freeze_rows + 1 ) || '" activePane="bottomLeft" state="frozen"/>'
+                         , l_yyy
                          );
         end if;
-        if workbook.sheets( s ).freeze_cols > 0
+        if workbook.sheets( l_s ).freeze_cols > 0
         then
-          addtxt2utf8blob( '<pane xSplit="' || workbook.sheets( s ).freeze_cols || '" topLeftCell="' || alfan_col( workbook.sheets( s ).freeze_cols + 1 ) || '1" activePane="bottomLeft" state="frozen"/>'
-                         , t_yyy
+          addtxt2utf8blob( '<pane xSplit="' || workbook.sheets( l_s ).freeze_cols || '" topLeftCell="' || alfan_col( workbook.sheets( l_s ).freeze_cols + 1 ) || '1" activePane="bottomLeft" state="frozen"/>'
+                         , l_yyy
                          );
         end if;
       end if;
       addtxt2utf8blob( '</sheetView>
 </sheetViews>
 <sheetFormatPr defaultRowHeight="15" x14ac:dyDescent="0.25"/>'
-                     , t_yyy
+                     , l_yyy
                      );
-      if workbook.sheets( s ).widths.count > 0
+      if workbook.sheets( l_s ).widths.count > 0
       then
-        addtxt2utf8blob( '<cols>', t_yyy );
-        t_col_ind := workbook.sheets( s ).widths.first;
-        while t_col_ind is not null
+        addtxt2utf8blob( '<cols>', l_yyy );
+        l_col_ind := workbook.sheets( l_s ).widths.first;
+        while l_col_ind is not null
         loop
-          addtxt2utf8blob( '<col min="' || t_col_ind || '" max="' || t_col_ind || '" width="' || to_char( workbook.sheets( s ).widths( t_col_ind ), 'TM9', 'NLS_NUMERIC_CHARACTERS=.,' ) || '" customWidth="1"/>', t_yyy );
-          t_col_ind := workbook.sheets( s ).widths.next( t_col_ind );
+          addtxt2utf8blob( '<col min="' || l_col_ind || '" max="' || l_col_ind || '" width="' || to_char( workbook.sheets( l_s ).widths( l_col_ind ), 'TM9', 'NLS_NUMERIC_CHARACTERS=.,' ) || '" customWidth="1"/>', l_yyy );
+          l_col_ind := workbook.sheets( l_s ).widths.next( l_col_ind );
         end loop;
-        addtxt2utf8blob( '</cols>', t_yyy );
+        addtxt2utf8blob( '</cols>', l_yyy );
       end if;
-      addtxt2utf8blob( '<sheetData>', t_yyy );
-      t_row_ind := workbook.sheets( s ).rows.first;
-      while t_row_ind is not null
+      addtxt2utf8blob( '<sheetData>', l_yyy );
+      l_row_ind := workbook.sheets( l_s ).rows.first;
+      while l_row_ind is not null
       loop
-        if workbook.sheets( s ).row_fmts.exists( t_row_ind ) and workbook.sheets( s ).row_fmts( t_row_ind ).height is not null
+        if workbook.sheets( l_s ).row_fmts.exists( l_row_ind ) and workbook.sheets( l_s ).row_fmts( l_row_ind ).height is not null
         then
-          addtxt2utf8blob( '<row r="' || t_row_ind || '" spans="' || t_col_min || ':' || t_col_max || '" customHeight="1" ht="'
-                         || to_char( workbook.sheets( s ).row_fmts( t_row_ind ).height, 'TM9', 'NLS_NUMERIC_CHARACTERS=.,' ) || '" >', t_yyy );
+          addtxt2utf8blob( '<row r="' || l_row_ind || '" spans="' || l_col_min || ':' || l_col_max || '" customHeight="1" ht="'
+                         || to_char( workbook.sheets( l_s ).row_fmts( l_row_ind ).height, 'TM9', 'NLS_NUMERIC_CHARACTERS=.,' ) || '" >', l_yyy );
         else
-          addtxt2utf8blob( '<row r="' || t_row_ind || '" spans="' || t_col_min || ':' || t_col_max || '">', t_yyy );
+          addtxt2utf8blob( '<row r="' || l_row_ind || '" spans="' || l_col_min || ':' || l_col_max || '">', l_yyy );
         end if;
-        t_col_ind := workbook.sheets( s ).rows( t_row_ind ).first;
-        while t_col_ind is not null
+        l_col_ind := workbook.sheets( l_s ).rows( l_row_ind ).first;
+        while l_col_ind is not null
         loop
-          addtxt2utf8blob( '<c r="' || alfan_col( t_col_ind ) || t_row_ind || '"'
-                 || ' ' || workbook.sheets( s ).rows( t_row_ind )( t_col_ind ).style
-                 || '>' || workbook.sheets( s ).rows( t_row_ind )( t_col_ind ).formula || '<v>'
-                 || to_char( workbook.sheets( s ).rows( t_row_ind )( t_col_ind ).value, 'TM9', 'NLS_NUMERIC_CHARACTERS=.,' )
-                 || '</v></c>', t_yyy );
-          t_col_ind := workbook.sheets( s ).rows( t_row_ind ).next( t_col_ind );
+          addtxt2utf8blob( '<c r="' || alfan_col( l_col_ind ) || l_row_ind || '"'
+                 || ' ' || workbook.sheets( l_s ).rows( l_row_ind )( l_col_ind ).style
+                 || '>' || workbook.sheets( l_s ).rows( l_row_ind )( l_col_ind ).formula || '<v>'
+                 || to_char( workbook.sheets( l_s ).rows( l_row_ind )( l_col_ind ).value, 'TM9', 'NLS_NUMERIC_CHARACTERS=.,' )
+                 || '</v></c>', l_yyy );
+          l_col_ind := workbook.sheets( l_s ).rows( l_row_ind ).next( l_col_ind );
         end loop;
-        addtxt2utf8blob( '</row>', t_yyy );
-        t_row_ind := workbook.sheets( s ).rows.next( t_row_ind );
+        addtxt2utf8blob( '</row>', l_yyy );
+        l_row_ind := workbook.sheets( l_s ).rows.next( l_row_ind );
       end loop;
-      addtxt2utf8blob( '</sheetData>', t_yyy );
-      for a in 1 ..  workbook.sheets( s ).autofilters.count
+      addtxt2utf8blob( '</sheetData>', l_yyy );
+      for a in 1 ..  workbook.sheets( l_s ).autofilters.count
       loop
         addtxt2utf8blob( '<autoFilter ref="' ||
-            alfan_col( nvl( workbook.sheets( s ).autofilters( a ).column_start, t_col_min ) ) ||
-            nvl( workbook.sheets( s ).autofilters( a ).row_start, workbook.sheets( s ).rows.first ) || ':' ||
-            alfan_col( coalesce( workbook.sheets( s ).autofilters( a ).column_end, workbook.sheets( s ).autofilters( a ).column_start, t_col_max ) ) ||
-            nvl( workbook.sheets( s ).autofilters( a ).row_end, workbook.sheets( s ).rows.last ) || '"/>', t_yyy );
+            alfan_col( nvl( workbook.sheets( l_s ).autofilters( a ).column_start, l_col_min ) ) ||
+            nvl( workbook.sheets( l_s ).autofilters( a ).row_start, workbook.sheets( l_s ).rows.first ) || ':' ||
+            alfan_col( coalesce( workbook.sheets( l_s ).autofilters( a ).column_end, workbook.sheets( l_s ).autofilters( a ).column_start, l_col_max ) ) ||
+            nvl( workbook.sheets( l_s ).autofilters( a ).row_end, workbook.sheets( l_s ).rows.last ) || '"/>', l_yyy );
       end loop;
-      if workbook.sheets( s ).mergecells.count > 0
+      if workbook.sheets( l_s ).mergecells.count > 0
       then
-        addtxt2utf8blob( '<mergeCells count="' || to_char( workbook.sheets( s ).mergecells.count ) || '">', t_yyy );
-        for m in 1 ..  workbook.sheets( s ).mergecells.count
+        addtxt2utf8blob( '<mergeCells count="' || to_char( workbook.sheets( l_s ).mergecells.count ) || '">', l_yyy );
+        for m in 1 ..  workbook.sheets( l_s ).mergecells.count
         loop
-          addtxt2utf8blob( '<mergeCell ref="' || workbook.sheets( s ).mergecells( m ) || '"/>', t_yyy );
+          addtxt2utf8blob( '<mergeCell ref="' || workbook.sheets( l_s ).mergecells( m ) || '"/>', l_yyy );
         end loop;
-        addtxt2utf8blob( '</mergeCells>', t_yyy );
+        addtxt2utf8blob( '</mergeCells>', l_yyy );
       end if;
 --
-      if workbook.sheets( s ).validations.count > 0
+      if workbook.sheets( l_s ).validations.count > 0
       then
-        addtxt2utf8blob( '<dataValidations count="' || to_char( workbook.sheets( s ).validations.count ) || '">', t_yyy );
-        for m in 1 ..  workbook.sheets( s ).validations.count
+        addtxt2utf8blob( '<dataValidations count="' || to_char( workbook.sheets( l_s ).validations.count ) || '">', l_yyy );
+        for m in 1 ..  workbook.sheets( l_s ).validations.count
         loop
           addtxt2utf8blob( '<dataValidation' ||
-              ' type="' || workbook.sheets( s ).validations( m ).type || '"' ||
-              ' errorStyle="' || workbook.sheets( s ).validations( m ).errorstyle || '"' ||
-              ' allowBlank="' || case when nvl( workbook.sheets( s ).validations( m ).allowBlank, true ) then '1' else '0' end || '"' ||
-              ' sqref="' || workbook.sheets( s ).validations( m ).sqref || '"', t_yyy );
-          if workbook.sheets( s ).validations( m ).prompt is not null
+              ' type="' || workbook.sheets( l_s ).validations( m ).type || '"' ||
+              ' errorStyle="' || workbook.sheets( l_s ).validations( m ).errorstyle || '"' ||
+              ' allowBlank="' || case when nvl( workbook.sheets( l_s ).validations( m ).allowBlank, true ) then '1' else '0' end || '"' ||
+              ' sqref="' || workbook.sheets( l_s ).validations( m ).sqref || '"', l_yyy );
+          if workbook.sheets( l_s ).validations( m ).prompt is not null
           then
-            addtxt2utf8blob( ' showInputMessage="1" prompt="' || workbook.sheets( s ).validations( m ).prompt || '"', t_yyy );
-            if workbook.sheets( s ).validations( m ).title is not null
+            addtxt2utf8blob( ' showInputMessage="1" prompt="' || workbook.sheets( l_s ).validations( m ).prompt || '"', l_yyy );
+            if workbook.sheets( l_s ).validations( m ).title is not null
             then
-              addtxt2utf8blob( ' promptTitle="' || workbook.sheets( s ).validations( m ).title || '"', t_yyy );
+              addtxt2utf8blob( ' promptTitle="' || workbook.sheets( l_s ).validations( m ).title || '"', l_yyy );
             end if;
           end if;
-          if workbook.sheets( s ).validations( m ).showerrormessage
+          if workbook.sheets( l_s ).validations( m ).showerrormessage
           then
-            addtxt2utf8blob( ' showErrorMessage="1"', t_yyy );
-            if workbook.sheets( s ).validations( m ).error_title is not null
+            addtxt2utf8blob( ' showErrorMessage="1"', l_yyy );
+            if workbook.sheets( l_s ).validations( m ).error_title is not null
             then
-              addtxt2utf8blob( ' errorTitle="' || workbook.sheets( s ).validations( m ).error_title || '"', t_yyy );
+              addtxt2utf8blob( ' errorTitle="' || workbook.sheets( l_s ).validations( m ).error_title || '"', l_yyy );
             end if;
-            if workbook.sheets( s ).validations( m ).error_txt is not null
+            if workbook.sheets( l_s ).validations( m ).error_txt is not null
             then
-              addtxt2utf8blob( ' error="' || workbook.sheets( s ).validations( m ).error_txt || '"', t_yyy );
+              addtxt2utf8blob( ' error="' || workbook.sheets( l_s ).validations( m ).error_txt || '"', l_yyy );
             end if;
           end if;
-          addtxt2utf8blob( '>', t_yyy );
-          if workbook.sheets( s ).validations( m ).formula1 is not null
+          addtxt2utf8blob( '>', l_yyy );
+          if workbook.sheets( l_s ).validations( m ).formula1 is not null
           then
-            addtxt2utf8blob( '<formula1>' || workbook.sheets( s ).validations( m ).formula1 || '</formula1>', t_yyy );
+            addtxt2utf8blob( '<formula1>' || workbook.sheets( l_s ).validations( m ).formula1 || '</formula1>', l_yyy );
           end if;
-          if workbook.sheets( s ).validations( m ).formula2 is not null
+          if workbook.sheets( l_s ).validations( m ).formula2 is not null
           then
-            addtxt2utf8blob( '<formula2>' || workbook.sheets( s ).validations( m ).formula2 || '</formula2>', t_yyy );
+            addtxt2utf8blob( '<formula2>' || workbook.sheets( l_s ).validations( m ).formula2 || '</formula2>', l_yyy );
           end if;
-          addtxt2utf8blob( '</dataValidation>', t_yyy );
+          addtxt2utf8blob( '</dataValidation>', l_yyy );
         end loop;
-        addtxt2utf8blob( '</dataValidations>', t_yyy );
+        addtxt2utf8blob( '</dataValidations>', l_yyy );
       end if;
 --
-      if workbook.sheets( s ).hyperlinks.count > 0
+      if workbook.sheets( l_s ).hyperlinks.count > 0
       then
-        addtxt2utf8blob( '<hyperlinks>', t_yyy );
-        for h in 1 ..  workbook.sheets( s ).hyperlinks.count
+        addtxt2utf8blob( '<hyperlinks>', l_yyy );
+        for h in 1 ..  workbook.sheets( l_s ).hyperlinks.count
         loop
-          addtxt2utf8blob( '<hyperlink ref="' || workbook.sheets( s ).hyperlinks( h ).cell || '"', t_yyy );
-          if workbook.sheets( s ).hyperlinks( h ).url is null
+          addtxt2utf8blob( '<hyperlink ref="' || workbook.sheets( l_s ).hyperlinks( h ).cell || '"', l_yyy );
+          if workbook.sheets( l_s ).hyperlinks( h ).url is null
           then
-            addtxt2utf8blob( ' location="' || workbook.sheets( s ).hyperlinks( h ).location || '"', t_yyy );
+            addtxt2utf8blob( ' location="' || workbook.sheets( l_s ).hyperlinks( h ).location || '"', l_yyy );
           else
-            addtxt2utf8blob( ' r:id="rId' || ( 3 + h ) || '"', t_yyy );
+            addtxt2utf8blob( ' r:id="rId' || ( 3 + h ) || '"', l_yyy );
           end if;
-          if workbook.sheets( s ).hyperlinks( h ).tooltip is not null
+          if workbook.sheets( l_s ).hyperlinks( h ).tooltip is not null
           then
-            addtxt2utf8blob( ' tooltip="' || workbook.sheets( s ).hyperlinks( h ).tooltip || '"/>', t_yyy );
+            addtxt2utf8blob( ' tooltip="' || workbook.sheets( l_s ).hyperlinks( h ).tooltip || '"/>', l_yyy );
           else
-            addtxt2utf8blob( '/>', t_yyy );
+            addtxt2utf8blob( '/>', l_yyy );
           end if;
         end loop;
-        addtxt2utf8blob( '</hyperlinks>', t_yyy );
+        addtxt2utf8blob( '</hyperlinks>', l_yyy );
       end if;
-      addtxt2utf8blob( '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>', t_yyy );
-      if workbook.sheets( s ).drawings.count > 0
+      addtxt2utf8blob( '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>', l_yyy );
+      if workbook.sheets( l_s ).drawings.count > 0
       then
-        addtxt2utf8blob( '<drawing r:id="rId3"/>', t_yyy );
+        addtxt2utf8blob( '<drawing r:id="rId3"/>', l_yyy );
       end if;
-      if workbook.sheets( s ).comments.count > 0
+      if workbook.sheets( l_s ).comments.count > 0
       then
-        addtxt2utf8blob( '<legacyDrawing r:id="rId1"/>', t_yyy );
+        addtxt2utf8blob( '<legacyDrawing r:id="rId1"/>', l_yyy );
       end if;
       --
       declare
@@ -2702,103 +2647,103 @@ case when workbook.sheets( s ).tabcolor is not null then '<sheetPr>' || add_rgb(
       begin
         for i in 1 .. workbook.tables.count
         loop
-          if workbook.tables( i ).sheet = s
+          if workbook.tables( i ).sheet = l_s
           then
             l_cnt := l_cnt + 1;
           end if;
         end loop;
         if l_cnt > 0
         then
-          addtxt2utf8blob( '<tableParts count="' || to_char( l_cnt ) || '">', t_yyy) ;
+          addtxt2utf8blob( '<tableParts count="' || to_char( l_cnt ) || '">', l_yyy) ;
           for i in 1 .. workbook.tables.count
           loop
-            if workbook.tables( i ).sheet = s
+            if workbook.tables( i ).sheet = l_s
             then
-              addtxt2utf8blob( '<tablePart r:id="rId' || to_char( 10000 + i ) || '"/>', t_yyy );
+              addtxt2utf8blob( '<tablePart r:id="rId' || to_char( 10000 + i ) || '"/>', l_yyy );
             end if;
           end loop;
-          addtxt2utf8blob( '</tableParts>', t_yyy );
+          addtxt2utf8blob( '</tableParts>', l_yyy );
         end if;
       end;
       --
-      addtxt2utf8blob( '</worksheet>', t_yyy );
-      addtxt2utf8blob_finish( t_yyy );
-      add1file( t_excel, 'xl/worksheets/sheet' || s || '.xml', t_yyy );
+      addtxt2utf8blob( '</worksheet>', l_yyy );
+      addtxt2utf8blob_finish( l_yyy );
+      add1file( p_excel, 'xl/worksheets/sheet' || l_s || '.xml', l_yyy );
       --
       if workbook.images.count > 0
       then
-        t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
         for i in 1 .. workbook.images.count
         loop
-          t_xxx := t_xxx || ( '<Relationship Id="rId'
+          l_xxx := l_xxx || ( '<Relationship Id="rId'
                          || i || '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/' || 'image' || i || '.png'
                          || '"/>' );
         end loop;
-        t_xxx := t_xxx || '</Relationships>';
-        add1xml( t_excel, 'xl/drawings/_rels/drawing' || s || '.xml.rels', t_xxx );
+        l_xxx := l_xxx || '</Relationships>';
+        add1xml( p_excel, 'xl/drawings/_rels/drawing' || l_s || '.xml.rels', l_xxx );
       end if;
       --
-      if (  workbook.sheets( s ).hyperlinks.count > 0
-         or workbook.sheets( s ).comments.count > 0
-         or workbook.sheets( s ).drawings.count > 0
+      if (  workbook.sheets( l_s ).hyperlinks.count > 0
+         or workbook.sheets( l_s ).comments.count > 0
+         or workbook.sheets( l_s ).drawings.count > 0
          or workbook.tables.count > 0
          )
       then
-        t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
-        if workbook.sheets( s ).comments.count > 0
+        if workbook.sheets( l_s ).comments.count > 0
         then
-          t_xxx := t_xxx || ( '<Relationship Id="rId2" Target="../comments' || s || '.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"/>' );
-          t_xxx := t_xxx || ( '<Relationship Id="rId1" Target="../drawings/vmlDrawing' || s || '.vml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing"/>' );
+          l_xxx := l_xxx || ( '<Relationship Id="rId2" Target="../comments' || l_s || '.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"/>' );
+          l_xxx := l_xxx || ( '<Relationship Id="rId1" Target="../drawings/vmlDrawing' || l_s || '.vml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing"/>' );
         end if;
-        if workbook.sheets( s ).drawings.count > 0
+        if workbook.sheets( l_s ).drawings.count > 0
         then
-          t_xxx := t_xxx || ( '<Relationship Id="rId3" Target="../drawings/drawing' || s || '.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"/>' );
+          l_xxx := l_xxx || ( '<Relationship Id="rId3" Target="../drawings/drawing' || l_s || '.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"/>' );
         end if;
-        for h in 1 ..  workbook.sheets( s ).hyperlinks.count
+        for h in 1 ..  workbook.sheets( l_s ).hyperlinks.count
         loop
-          if workbook.sheets( s ).hyperlinks( h ).url is not null
+          if workbook.sheets( l_s ).hyperlinks( h ).url is not null
           then
-            t_xxx := t_xxx || ( '<Relationship Id="rId' || ( 3 + h ) || '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="' || workbook.sheets( s ).hyperlinks( h ).url || '" TargetMode="External"/>' );
+            l_xxx := l_xxx || ( '<Relationship Id="rId' || ( 3 + h ) || '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="' || workbook.sheets( l_s ).hyperlinks( h ).url || '" TargetMode="External"/>' );
           end if;
         end loop;
         for i in 1 .. workbook.tables.count
         loop
-          if workbook.tables( i ).sheet = s
+          if workbook.tables( i ).sheet = l_s
           then
-            t_xxx := t_xxx ||  ( '<Relationship Id="rId' || to_char( 10000 + i ) || '"' ||
+            l_xxx := l_xxx ||  ( '<Relationship Id="rId' || to_char( 10000 + i ) || '"' ||
                                  ' Target="../tables/table' || to_char( i ) || '.xml"' ||
                                  ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table"/>' );
           end if;
         end loop;
-        t_xxx := t_xxx || '</Relationships>';
-        add1xml( t_excel, 'xl/worksheets/_rels/sheet' || s || '.xml.rels', t_xxx );
+        l_xxx := l_xxx || '</Relationships>';
+        add1xml( p_excel, 'xl/worksheets/_rels/sheet' || l_s || '.xml.rels', l_xxx );
         --
-        if workbook.sheets( s ).drawings.count > 0
+        if workbook.sheets( l_s ).drawings.count > 0
         then
-          t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">';
-          for i in 1 .. workbook.sheets( s ).drawings.count
+          for i in 1 .. workbook.sheets( l_s ).drawings.count
           loop
-            t_xxx := t_xxx || finish_drawing( workbook.sheets( s ).drawings( i ), i, s );
+            l_xxx := l_xxx || finish_drawing( workbook.sheets( l_s ).drawings( i ), i, l_s );
           end loop;
-          t_xxx := t_xxx || '</xdr:wsDr>';
-          add1xml( t_excel, 'xl/drawings/drawing' || s || '.xml', t_xxx );
+          l_xxx := l_xxx || '</xdr:wsDr>';
+          add1xml( p_excel, 'xl/drawings/drawing' || l_s || '.xml', l_xxx );
         end if;
 --
-        if workbook.sheets( s ).comments.count > 0
+        if workbook.sheets( l_s ).comments.count > 0
         then
           declare
             cnt pls_integer;
             author_ind tp_author;
           begin
             authors.delete;
-            for c in 1 .. workbook.sheets( s ).comments.count
+            for c in 1 .. workbook.sheets( l_s ).comments.count
             loop
-              authors( nvl( workbook.sheets( s ).comments( c ).author, ' ' ) ) := 0;
+              authors( nvl( workbook.sheets( l_s ).comments( c ).author, ' ' ) ) := 0;
             end loop;
-            t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <authors>';
             cnt := 0;
@@ -2806,130 +2751,154 @@ case when workbook.sheets( s ).tabcolor is not null then '<sheetPr>' || add_rgb(
             while author_ind is not null or authors.next( author_ind ) is not null
             loop
               authors( author_ind ) := cnt;
-              t_xxx := t_xxx || ( '<author>' || author_ind || '</author>' );
+              l_xxx := l_xxx || ( '<author>' || author_ind || '</author>' );
               cnt := cnt + 1;
               author_ind := authors.next( author_ind );
             end loop;
           end;
-          t_xxx := t_xxx || '</authors><commentList>';
-          for c in 1 .. workbook.sheets( s ).comments.count
+          l_xxx := l_xxx || '</authors><commentList>';
+          for c in 1 .. workbook.sheets( l_s ).comments.count
           loop
-            t_xxx := t_xxx || ( '<comment ref="' || alfan_col( workbook.sheets( s ).comments( c ).column ) ||
-               to_char( workbook.sheets( s ).comments( c ).row ) || '"' ||
-               ' authorId="' || authors( nvl( workbook.sheets( s ).comments( c ).author, ' ' ) ) || '"><text>' );
-            if workbook.sheets( s ).comments( c ).author is not null
+            l_xxx := l_xxx || ( '<comment ref="' || alfan_col( workbook.sheets( l_s ).comments( c ).column ) ||
+               to_char( workbook.sheets( l_s ).comments( c ).row ) || '"' ||
+               ' authorId="' || authors( nvl( workbook.sheets( l_s ).comments( c ).author, ' ' ) ) || '"><text>' );
+            if workbook.sheets( l_s ).comments( c ).author is not null
             then
-              t_xxx := t_xxx || ( '<r><rPr><b/><sz val="9"/><color indexed="81"/><rFont val="Tahoma"/><charset val="1"/></rPr><t xml:space="preserve">' ||
-                 workbook.sheets( s ).comments( c ).author || ':</t></r>' );
+              l_xxx := l_xxx || ( '<r><rPr><b/><sz val="9"/><color indexed="81"/><rFont val="Tahoma"/><charset val="1"/></rPr><t xml:space="preserve">' ||
+                 workbook.sheets( l_s ).comments( c ).author || ':</t></r>' );
             end if;
-            t_xxx := t_xxx || ( '<r><rPr><sz val="9"/><color indexed="81"/><rFont val="Tahoma"/><charset val="1"/></rPr><t xml:space="preserve">' ||
-               case when workbook.sheets( s ).comments( c ).author is not null then '
-' end || workbook.sheets( s ).comments( c ).text || '</t></r></text></comment>' );
+            l_xxx := l_xxx || ( '<r><rPr><sz val="9"/><color indexed="81"/><rFont val="Tahoma"/><charset val="1"/></rPr><t xml:space="preserve">' ||
+               case when workbook.sheets( l_s ).comments( c ).author is not null then '
+' end || workbook.sheets( l_s ).comments( c ).text || '</t></r></text></comment>' );
           end loop;
-          t_xxx := t_xxx || '</commentList></comments>';
-          add1xml( t_excel, 'xl/comments' || s || '.xml', t_xxx );
-          t_xxx := '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
+          l_xxx := l_xxx || '</commentList></comments>';
+          add1xml( p_excel, 'xl/comments' || l_s || '.xml', l_xxx );
+          l_xxx := '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
 <o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="2"/></o:shapelayout>
 <v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>';
-          for c in 1 .. workbook.sheets( s ).comments.count
+          for c in 1 .. workbook.sheets( l_s ).comments.count
           loop
-            t_xxx := t_xxx || ( '<v:shape id="_x0000_s' || to_char( c ) || '" type="#_x0000_t202"
+            l_xxx := l_xxx || ( '<v:shape id="_x0000_s' || to_char( c ) || '" type="#_x0000_t202"
 style="position:absolute;margin-left:35.25pt;margin-top:3pt;z-index:' || to_char( c ) || ';visibility:hidden;" fillcolor="#ffffe1" o:insetmode="auto">
 <v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/>
 <v:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></v:textbox>
 <x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/>' );
-            t_w := workbook.sheets( s ).comments( c ).width;
-            t_c := 1;
+            l_w := workbook.sheets( l_s ).comments( c ).width;
+            l_c := 1;
             loop
-              if workbook.sheets( s ).widths.exists( workbook.sheets( s ).comments( c ).column + t_c )
+              if workbook.sheets( l_s ).widths.exists( workbook.sheets( l_s ).comments( c ).column + l_c )
               then
-                t_cw := 256 * workbook.sheets( s ).widths( workbook.sheets( s ).comments( c ).column + t_c );
-                t_cw := trunc( ( t_cw + 18 ) / 256 * 7); -- assume default 11 point Calibri
+                l_cw := 256 * workbook.sheets( l_s ).widths( workbook.sheets( l_s ).comments( c ).column + l_c );
+                l_cw := trunc( ( l_cw + 18 ) / 256 * 7); -- assume default 11 point Calibri
               else
-                t_cw := 64;
+                l_cw := 64;
               end if;
-              exit when t_w < t_cw;
-              t_c := t_c + 1;
-              t_w := t_w - t_cw;
+              exit when l_w < l_cw;
+              l_c := l_c + 1;
+              l_w := l_w - l_cw;
             end loop;
-            t_h := workbook.sheets( s ).comments( c ).height;
-            t_xxx := t_xxx || ( '<x:Anchor>' || workbook.sheets( s ).comments( c ).column || ',15,' ||
-                       workbook.sheets( s ).comments( c ).row || ',30,' ||
-                       ( workbook.sheets( s ).comments( c ).column + t_c - 1 ) || ',' || round( t_w ) || ',' ||
-                       ( workbook.sheets( s ).comments( c ).row + 1 + trunc( t_h / 20 ) ) || ',' || mod( t_h, 20 ) || '</x:Anchor>' );
-            t_xxx := t_xxx || ( '<x:AutoFill>False</x:AutoFill><x:Row>' ||
-              ( workbook.sheets( s ).comments( c ).row - 1 ) || '</x:Row><x:Column>' ||
-              ( workbook.sheets( s ).comments( c ).column - 1 ) || '</x:Column></x:ClientData></v:shape>' );
+            l_h := workbook.sheets( l_s ).comments( c ).height;
+            l_xxx := l_xxx || ( '<x:Anchor>' || workbook.sheets( l_s ).comments( c ).column || ',15,' ||
+                       workbook.sheets( l_s ).comments( c ).row || ',30,' ||
+                       ( workbook.sheets( l_s ).comments( c ).column + l_c - 1 ) || ',' || round( l_w ) || ',' ||
+                       ( workbook.sheets( l_s ).comments( c ).row + 1 + trunc( l_h / 20 ) ) || ',' || mod( l_h, 20 ) || '</x:Anchor>' );
+            l_xxx := l_xxx || ( '<x:AutoFill>False</x:AutoFill><x:Row>' ||
+              ( workbook.sheets( l_s ).comments( c ).row - 1 ) || '</x:Row><x:Column>' ||
+              ( workbook.sheets( l_s ).comments( c ).column - 1 ) || '</x:Column></x:ClientData></v:shape>' );
           end loop;
-          t_xxx := t_xxx || '</xml>';
-          add1xml( t_excel, 'xl/drawings/vmlDrawing' || s || '.vml', t_xxx );
+          l_xxx := l_xxx || '</xml>';
+          add1xml( p_excel, 'xl/drawings/vmlDrawing' || l_s || '.vml', l_xxx );
         end if;
       end if;
 --
-      s := workbook.sheets.next( s );
+      l_s := workbook.sheets.next( l_s );
     end loop;
-    t_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+  end build_worksheets;
+  --
+  procedure build_workbook_rels( p_excel in out nocopy blob )
+  is
+    l_xxx clob;
+    l_s pls_integer;
+  begin
+    l_xxx := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
 <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>';
-    s := workbook.sheets.first;
-    while s is not null
+    l_s := workbook.sheets.first;
+    while l_s is not null
     loop
-      t_xxx := t_xxx || ( '
-<Relationship Id="rId' || ( 9 + s ) || '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' || s || '.xml"/>' );
-      s := workbook.sheets.next( s );
+      l_xxx := l_xxx || ( '
+<Relationship Id="rId' || ( 9 + l_s ) || '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' || l_s || '.xml"/>' );
+      l_s := workbook.sheets.next( l_s );
     end loop;
-    t_xxx := t_xxx || '</Relationships>';
-    add1xml( t_excel, 'xl/_rels/workbook.xml.rels', t_xxx );
-    --
+    l_xxx := l_xxx || '</Relationships>';
+    add1xml( p_excel, 'xl/_rels/workbook.xml.rels', l_xxx );
+  end build_workbook_rels;
+  --
+  procedure build_images( p_excel in out nocopy blob )
+  is
+  begin
     for i in 1 .. workbook.images.count
     loop
-      add1file( t_excel, 'xl/media/image' || i || '.png', workbook.images(i).img );
+      add1file( p_excel, 'xl/media/image' || i || '.png', workbook.images(i).img );
     end loop;
-    --
-    addtxt2utf8blob_init( t_yyy );
+  end build_images;
+  --
+  procedure build_shared_strings( p_excel in out nocopy blob )
+  is
+    l_yyy blob;
+  begin
+    addtxt2utf8blob_init( l_yyy );
     addtxt2utf8blob( '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="' || workbook.str_cnt || '" uniqueCount="' || workbook.strings.count || '">'
-                  , t_yyy
+                  , l_yyy
                   );
     for i in 0 .. workbook.str_ind.count - 1
     loop
-      addtxt2utf8blob( '<si><t xml:space="preserve">' || dbms_xmlgen.convert( substr( workbook.str_ind( i ), 1, 32000 ) ) || '</t></si>', t_yyy );
+      addtxt2utf8blob( '<si><t xml:space="preserve">' || dbms_xmlgen.convert( substr( workbook.str_ind( i ), 1, 32000 ) ) || '</t></si>', l_yyy );
     end loop;
-    addtxt2utf8blob( '</sst>', t_yyy );
-    addtxt2utf8blob_finish( t_yyy );
-    add1file( t_excel, 'xl/sharedStrings.xml', t_yyy );
-    finish_zip( t_excel );
+    addtxt2utf8blob( '</sst>', l_yyy );
+    addtxt2utf8blob_finish( l_yyy );
+    add1file( p_excel, 'xl/sharedStrings.xml', l_yyy );
+  end build_shared_strings;
+  --
+  function finish( p_password varchar2 := null )
+  return blob
+  is
+    l_excel blob;
+  begin
+    dbms_lob.createtemporary( l_excel, true );
+    build_content_types( l_excel );
+    build_tables( l_excel );
+    build_core_properties( l_excel );
+    build_app_properties( l_excel );
+    build_relationships( l_excel );
+    build_styles( l_excel );
+    build_workbook( l_excel );
+    build_theme( l_excel );
+    build_worksheets( l_excel );
+    build_workbook_rels( l_excel );
+    build_images( l_excel );
+    build_shared_strings( l_excel );
+    finish_zip( l_excel );
     clear_workbook;
 $IF as_xlsx.use_dbms_crypto
 $THEN
     if p_password is not null
     then
-      return excel_encrypt( t_excel, p_password );
+      return excel_encrypt( l_excel, p_password );
     else
-      return t_excel;
+      return l_excel;
     end if;
 $ELSE
-    return t_excel;
+    return l_excel;
 $END
   end finish;
---
-  procedure save
-    ( p_directory varchar2
-    , p_filename varchar2
-    , p_password varchar2 := null
-    )
-  is
-  begin
-    blob2file( finish( p_password ), p_directory, p_filename );
-  end;
 --
   function query2sheet
     ( p_c              in out integer
     , p_column_headers boolean
-    , p_directory      varchar2
-    , p_filename       varchar2
     , p_sheet          pls_integer
     , p_UseXf          boolean
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -3112,11 +3081,6 @@ $END
         );
     end if;
     --
-    if ( p_directory is not null and  p_filename is not null )
-    then
-      save( p_directory, p_filename );
-    end if;
-    --
     setUseXf( t_useXf );
     return l_rows;
   exception
@@ -3133,8 +3097,6 @@ $END
   function query2sheet
     ( p_sql            varchar2
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -3156,8 +3118,6 @@ $END
     return query2sheet
              ( p_c              => t_c
              , p_column_headers => p_column_headers
-             , p_directory      => p_directory
-             , p_filename       => p_filename
              , p_sheet          => p_sheet
              , p_UseXf          => p_UseXf
              , p_date_format    => p_date_format
@@ -3173,8 +3133,6 @@ $END
   function query2sheet
     ( p_rc             in out sys_refcursor
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -3194,8 +3152,6 @@ $END
     return query2sheet
              ( p_c              => t_c
              , p_column_headers => p_column_headers
-             , p_directory      => p_directory
-             , p_filename       => p_filename
              , p_sheet          => p_sheet
              , p_UseXf          => p_UseXf
              , p_date_format    => p_date_format
@@ -3211,8 +3167,6 @@ $END
   procedure query2sheet
     ( p_sql            varchar2
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -3229,8 +3183,6 @@ $END
     l_dummy := query2sheet
                  ( p_sql            => p_sql
                  , p_column_headers => p_column_headers
-                 , p_directory      => p_directory
-                 , p_filename       => p_filename
                  , p_sheet          => p_sheet
                  , p_UseXf          => p_UseXf
                  , p_date_format    => p_date_format
@@ -3246,8 +3198,6 @@ $END
   procedure query2sheet
     ( p_rc             in out sys_refcursor
     , p_column_headers boolean     := true
-    , p_directory      varchar2    := null
-    , p_filename       varchar2    := null
     , p_sheet          pls_integer := null
     , p_UseXf          boolean     := false
     , p_date_format    varchar2    := 'dd/mm/yyyy'
@@ -3264,8 +3214,6 @@ $END
     l_dummy := query2sheet
                  ( p_rc             => p_rc
                  , p_column_headers => p_column_headers
-                 , p_directory      => p_directory
-                 , p_filename       => p_filename
                  , p_sheet          => p_sheet
                  , p_UseXf          => p_UseXf
                  , p_date_format    => p_date_format
@@ -3424,641 +3372,6 @@ $END
     l_drawing.description := p_description;
     workbook.sheets( l_sheet ).drawings( workbook.sheets( l_sheet ).drawings.count + 1 ) := l_drawing;
   end add_image;
---
-  function get_encoding( p_encoding varchar2 := null )
-  return varchar2
-  is
-    l_encoding varchar2(32767);
-  begin
-    if p_encoding is not null
-    then
-      if nls_charset_id( p_encoding ) is null
-      then
-        l_encoding := utl_i18n.map_charset( p_encoding, utl_i18n.GENERIC_CONTEXT, utl_i18n.IANA_TO_ORACLE );
-      else
-        l_encoding := p_encoding;
-      end if;
-    end if;
-    return coalesce( l_encoding, 'US8PC437' ); -- IBM codepage 437
-  end;
-  --
-  function char2raw( p_txt varchar2 character set any_cs, p_encoding varchar2 := null )
-  return raw
-  is
-  begin
-    if isnchar( p_txt )
-    then -- on my 12.1 database, which is not AL32UTF8,
-         -- utl_i18n.string_to_raw( p_txt, get_encoding( p_encoding ) does not work
-      return utl_raw.convert( utl_i18n.string_to_raw( p_txt )
-                            , get_encoding( p_encoding )
-                            , nls_charset_name( nls_charset_id( 'NCHAR_CS' ) )
-                            );
-    end if;
-    return utl_i18n.string_to_raw( p_txt, get_encoding( p_encoding ) );
-  end;
-  --
-  procedure get_zip_info( p_zip blob, p_info out tp_zip_info )
-  is
-    l_ind integer;
-    l_buf_sz pls_integer := 2024;
-    l_start_buf integer;
-    l_buf raw(32767);
-  begin
-    p_info.len := nvl( dbms_lob.getlength( p_zip ), 0 );
-    if p_info.len < 22
-    then -- no (zip) file or empty zip file
-      return;
-    end if;
-    l_start_buf := greatest( p_info.len - l_buf_sz + 1, 1 );
-    l_buf := dbms_lob.substr( p_zip, l_buf_sz, l_start_buf );
-    l_ind := utl_raw.length( l_buf ) - 21;
-    loop
-      exit when l_ind < 1 or utl_raw.substr( l_buf, l_ind, 4 ) = c_END_OF_CENTRAL_DIRECTORY;
-      l_ind := l_ind - 1;
-    end loop;
-    if l_ind > 0
-    then
-      l_ind := l_ind + l_start_buf - 1;
-    else
-      l_ind := p_info.len - 21;
-      loop
-        exit when l_ind < 1 or dbms_lob.substr( p_zip, 4, l_ind ) = c_END_OF_CENTRAL_DIRECTORY;
-        l_ind := l_ind - 1;
-      end loop;
-    end if;
-    if l_ind <= 0
-    then
-      raise_application_error( -20001, 'Error parsing the zipfile' );
-    end if;
-    l_buf := dbms_lob.substr( p_zip, 22, l_ind );
-    if    utl_raw.substr( l_buf, 5, 2 ) != utl_raw.substr( l_buf, 7, 2 )  -- this disk = disk with start of Central Dir
-       or utl_raw.substr( l_buf, 9, 2 ) != utl_raw.substr( l_buf, 11, 2 ) -- complete CD on this disk
-    then
-      raise_application_error( -20003, 'Error parsing the zipfile' );
-    end if;
-    p_info.idx_eocd := l_ind;
-    p_info.idx_cd := little_endian( l_buf, 17, 4 ) + 1;
-    p_info.cnt := little_endian( l_buf, 9, 2 );
-    p_info.len_cd := p_info.idx_eocd - p_info.idx_cd;
-  end;
-  --
-  function parse_central_file_header( p_zip blob, p_ind integer, p_cfh out tp_cfh )
-  return boolean
-  is
-    l_tmp pls_integer;
-    l_len pls_integer;
-    l_buf raw(32767);
-  begin
-    l_buf := dbms_lob.substr( p_zip, 46, p_ind );
-    if utl_raw.substr( l_buf, 1, 4 ) != c_CENTRAL_FILE_HEADER
-    then
-      return false;
-    end if;
-    p_cfh.crc32 := utl_raw.substr( l_buf, 17, 4 );
-    p_cfh.n := little_endian( l_buf, 29, 2 );
-    p_cfh.m := little_endian( l_buf, 31, 2 );
-    p_cfh.k := little_endian( l_buf, 33, 2 );
-    p_cfh.len := 46 + p_cfh.n + p_cfh.m + p_cfh.k;
-    --
-    p_cfh.utf8 := bitand( to_number( utl_raw.substr( l_buf, 10, 1 ), 'XX' ), 8 ) > 0;
-    if p_cfh.n > 0
-    then
-      p_cfh.name1 := dbms_lob.substr( p_zip, least( p_cfh.n, 32767 ), p_ind + 46 );
-    end if;
-    --
-    p_cfh.compressed_len := little_endian( l_buf, 21, 4 );
-    p_cfh.original_len := little_endian( l_buf, 25, 4 );
-    p_cfh.offset := little_endian( l_buf, 43, 4 );
-    --
-    return true;
-  end;
-  --
-  function get_central_file_header
-    ( p_zip      blob
-    , p_name     varchar2 character set any_cs
-    , p_idx      number
-    , p_encoding varchar2
-    , p_cfh      out tp_cfh
-    )
-  return boolean
-  is
-    l_rv        boolean;
-    l_ind       integer;
-    l_idx       integer;
-    l_info      tp_zip_info;
-    l_name      raw(32767);
-    l_utf8_name raw(32767);
-  begin
-    if p_name is null and p_idx is null
-    then
-      return false;
-    end if;
-    get_zip_info( p_zip, l_info );
-    if nvl( l_info.cnt, 0 ) < 1
-    then -- no (zip) file or empty zip file
-      return false;
-    end if;
-    --
-    if p_name is not null
-    then
-      l_name := char2raw( p_name, p_encoding );
-      l_utf8_name := char2raw( p_name, 'AL32UTF8' );
-    end if;
-    --
-    l_rv := false;
-    l_ind := l_info.idx_cd;
-    l_idx := 1;
-    loop
-      exit when not parse_central_file_header( p_zip, l_ind, p_cfh );
-      if l_idx = p_idx
-         or p_cfh.name1 = case when p_cfh.utf8 then l_utf8_name else l_name end
-      then
-        l_rv := true;
-        exit;
-      end if;
-      l_ind := l_ind + p_cfh.len;
-      l_idx := l_idx + 1;
-    end loop;
-    --
-    p_cfh.idx := l_idx;
-    p_cfh.encoding := get_encoding( p_encoding );
-    return l_rv;
-  end;
-  --
-  function parse_file( p_zipped_blob blob, p_fh in out tp_cfh )
-  return blob
-  is
-    l_rv blob;
-    l_buf raw(3999);
-    l_compression_method varchar2(4);
-    l_n integer;
-    l_m integer;
-    l_crc raw(4);
-  begin
-    if p_fh.original_len is null
-    then
-      raise_application_error( -20006, 'File not found' );
-    end if;
-    if nvl( p_fh.original_len, 0 ) = 0
-    then
-      return empty_blob();
-    end if;
-    l_buf := dbms_lob.substr( p_zipped_blob, 30, p_fh.offset + 1 );
-    if utl_raw.substr( l_buf, 1, 4 ) != c_LOCAL_FILE_HEADER
-    then
-      raise_application_error( -20007, 'Error parsing the zipfile' );
-    end if;
-    l_compression_method := utl_raw.substr( l_buf, 9, 2 );
-    l_n := little_endian( l_buf, 27, 2 );
-    l_m := little_endian( l_buf, 29, 2 );
-    if l_compression_method = '0800'
-    then
-      if p_fh.original_len < 32767 and p_fh.compressed_len < 32748
-      then
-        return utl_compress.lz_uncompress( utl_raw.concat
-                 ( hextoraw( '1F8B0800000000000003' )
-                 , dbms_lob.substr( p_zipped_blob, p_fh.compressed_len, p_fh.offset + 31 + l_n + l_m )
-                 , p_fh.crc32
-                 , utl_raw.substr( utl_raw.reverse( to_char( p_fh.original_len, 'fm0XXXXXXXXXXXXXXX' ) ), 1, 4 )
-                 ) );
-      end if;
-      l_rv := hextoraw( '1F8B0800000000000003' ); -- gzip header
-      dbms_lob.copy( l_rv
-                   , p_zipped_blob
-                   , p_fh.compressed_len
-                   , 11
-                   , p_fh.offset + 31 + l_n + l_m
-                   );
-      dbms_lob.append( l_rv
-                     , utl_raw.concat( p_fh.crc32
-                                     , utl_raw.substr( utl_raw.reverse( to_char( p_fh.original_len, 'fm0XXXXXXXXXXXXXXX' ) ), 1, 4 )
-                                     )
-                     );
-      return utl_compress.lz_uncompress( l_rv );
-    elsif l_compression_method = '0000'
-    then
-      if p_fh.original_len < 32767 and p_fh.compressed_len < 32767
-      then
-        return dbms_lob.substr( p_zipped_blob
-                              , p_fh.compressed_len
-                              , p_fh.offset + 31 + l_n + l_m
-                              );
-      end if;
-      dbms_lob.createtemporary( l_rv, true, c_lob_duration );
-      dbms_lob.copy( l_rv
-                   , p_zipped_blob
-                   , p_fh.compressed_len
-                   , 1
-                   , p_fh.offset + 31 + l_n + l_m
-                   );
-      return l_rv;
-    end if;
-    raise_application_error( -20008, 'Unhandled compression method ' || l_compression_method );
-  end parse_file;
-  --
-  function get_count( p_zipped_blob blob )
-  return integer
-  is
-    l_info tp_zip_info;
-  begin
-    get_zip_info( p_zipped_blob, l_info );
-    return nvl( l_info.cnt, 0 );
-  end;
-  --
-  function file2blob( p_dir varchar2, p_file_name varchar2 )
-  return blob
-  is
-    file_lob bfile;
-    file_blob blob;
-    dest_offset integer := 1;
-    src_offset  integer := 1;
-  begin
-    file_lob := bfilename( p_dir, p_file_name );
-    dbms_lob.open( file_lob, dbms_lob.file_readonly );
-    dbms_lob.createtemporary( file_blob, true, c_lob_duration );
-    dbms_lob.loadblobfromfile( file_blob, file_lob, dbms_lob.lobmaxsize, dest_offset, src_offset );
-    dbms_lob.close( file_lob );
-    return file_blob;
-  exception
-    when others then
-      if dbms_lob.isopen( file_lob ) = 1
-      then
-        dbms_lob.close( file_lob );
-      end if;
-      if dbms_lob.istemporary( file_blob ) = 1
-      then
-        dbms_lob.freetemporary( file_blob );
-      end if;
-      raise;
-  end file2blob;
-  --
-  function get_sheet_names( p_xlsx blob )
-  return sheet_names
-  is
-    l_cfh      tp_cfh;
-    l_workbook blob;
-    l_rv       sheet_names;
-  begin
-    if not get_central_file_header( p_xlsx, 'xl\workbook.xml', null, null, l_cfh )
-    then
-      for i in 1 .. get_count( p_xlsx )
-      loop
-        exit when not get_central_file_header( p_xlsx, null, i, null, l_cfh )
-               or lower( utl_raw.cast_to_varchar2( l_cfh.name1 ) ) like '%workbook.xml';
-      end loop;
-    end if;
-    if l_cfh.original_len is null
-    then
-      l_rv := sheet_names();
-    else
-      l_workbook := parse_file( p_xlsx, l_cfh );
-      select xt1.name
-      bulk collect into l_rv
-      from xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-                                  , 'http://purl.oclc.org/ooxml/spreadsheetml/main' as "x" )
-                   , '( /workbook/sheets/sheet, /x:workbook/x:sheets/x:sheet )'
-                     passing xmltype( xmldata => l_workbook, csid => nls_charset_id( 'AL32UTF8' ) )
-                     columns
-                       name varchar2(4000) path '@name'
-                   ) xt1;
-    end if;
-    return l_rv;
-  end get_sheet_names;
-  --
-  function read
-    ( p_xlsx           blob
-    , p_sheets         varchar2 := null
-    , p_cell           varchar2 := null
-    , p_include_clobs  varchar2 := null
-    , p_add_empty_cols varchar2 := null
-    )
-  return tp_all_cells pipelined
-  is
-    l_nr             number;
-    l_cnt            pls_integer;
-    l_cfh            tp_cfh;
-    l_name           varchar2(32767);
-    l_workbook       blob;
-    l_workbook_rels  blob;
-    l_shared_strings blob;
-    l_file           blob;
-    l_csid_utf8      integer := nls_charset_id( 'AL32UTF8' );
-    type tp_strings     is table of varchar2(32767);
-    type tp_string_lens is table of varchar2(32767);
-    type tp_boolean_tab is table of boolean index by pls_integer;
-    l_strings      tp_strings;
-    l_string_lens  tp_string_lens;
-    l_quote_prefix tp_boolean_tab;
-    l_date_styles  tp_boolean_tab;
-    l_time_styles  tp_boolean_tab;
-    l_one_cell     tp_one_cell;
-    l_empty_cols    boolean;
-    l_prev_col_nr   number(10);
-    l_prev_row_nr   number(10);
-    l_null_cell     tp_one_cell;
-  begin
-    l_cnt := get_count( p_xlsx );
-    for i in 1 .. l_cnt
-    loop
-      exit when not get_central_file_header( p_xlsx, null, i, null, l_cfh );
-      l_name := lower( utl_raw.cast_to_varchar2( l_cfh.name1 ) );
-      if    l_name like '%workbook.xml'      then
-        l_workbook      := parse_file( p_xlsx, l_cfh );
-      elsif l_name like '%workbook.xml.rels' then
-        l_workbook_rels := parse_file( p_xlsx, l_cfh );
-      elsif l_name like '%sharedstrings.xml' then
-        l_shared_strings := parse_file( p_xlsx, l_cfh );
-        select xt1.txt
-             , xt1.len
-        bulk collect into l_strings, l_string_lens
-        from xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-                                    , 'http://purl.oclc.org/ooxml/spreadsheetml/main' as "x" )
-                     , '( /sst/si, /x:sst/x:si )'
-                       passing xmltype( xmldata => l_shared_strings, csid => l_csid_utf8 )
-                       columns txt varchar2(4000 char) path 'substring( string-join(.//*:t/text(), "" ), 1, 3900 )'
-                             , len integer             path 'string-length( string-join(.//*:t/text(), "" ) )'
-                     ) xt1;
-      elsif l_name like '%styles.xml' then
-        l_file := parse_file( p_xlsx, l_cfh );
-        for r_n in ( select xt2.seq - 1 seq
-                          , xt2.id
-                          , xt2.quoteprefix
-                          , lower( xt3.format ) format
-                     from xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-                                                 , 'http://purl.oclc.org/ooxml/spreadsheetml/main' as "x" )
-                                  , '( /styleSheet, /x:styleSheet )'
-                                    passing xmltype( xmldata => l_file, csid => nls_charset_id( 'AL32UTF8' ) )
-                                      columns cellxfs xmltype path '( cellXfs, x:cellXfs )'
-                                            , numfmts xmltype path '( numFmts, x:numFmts )'
-                                  ) xt1
-                     cross join
-                          xmltable( '/*:cellXfs/*:xf'
-                                    passing xt1.cellxfs
-                                      columns seq for ordinality
-                                            , id          integer        path '@numFmtId'
-                                            , quoteprefix varchar2(4000) path '@quotePrefix'
-                                  ) xt2
-                     left join
-                          xmltable( '/*:numFmts/*:numFmt'
-                                    passing xt1.numfmts
-                                    columns id3    integer        path '@numFmtId'
-                                          , format varchar2(4000) path '@formatCode'
-                                  ) xt3
-                     on xt3.id3 = xt2.id
-                   )
-        loop
-          if    r_n.id between 14 and 17
-             or ( instr( r_n.format, 'd' ) > 0 and instr( r_n.format, 'red' ) = 0 )
-             or instr( r_n.format, 'y' ) > 0
-          then
-            l_date_styles( r_n.seq ) := null;
-          elsif r_n.id between 18 and 22
-             or r_n.id between 45 and 47
-             or instr( r_n.format, 'h' ) > 0
-             or instr( r_n.format, 'm' ) > 0
-          then
-            l_time_styles( r_n.seq ) := null;
-          elsif r_n.quoteprefix in ( '1', 'true' )
-          then
-            l_quote_prefix( r_n.seq ) := null;
-          end if;
-        end loop;
-        dbms_lob.freetemporary( l_file );
-      end if;
-    end loop;
-    if l_workbook is null or l_workbook_rels is null
-    then
-      raise no_data_needed;
-    end if;
-    --
-    if upper( substr( p_add_empty_cols, 1, 1 ) ) in ( 'Y', 'T', '1' )
-    then
-      l_empty_cols := true;
-      l_null_cell.cell_type := 'S';
-    end if;
-    for r_x in ( select xt1.d1904
-                      , xt2.seq
-                      , xt2.name
-                      , xt3.target
-                 from xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-                                                     , 'http://purl.oclc.org/ooxml/spreadsheetml/main' as "x" )
-                              , '( /workbook, /x:workbook )'
-                                passing xmltype( xmldata => l_workbook, csid => nls_charset_id( 'AL32UTF8' ) )
-                                columns d1904  varchar2( 4000 ) path '*:workbookPr/@date1904'
-                                      , sheets xmltype path '*:sheets'
-                              ) xt1
-                 cross join
-                      xmltable( '*:sheets/*:sheet'
-                                passing xt1.sheets
-                                columns seq for ordinality
-                                      , name    varchar2( 4000 ) path '@name'
-                                      , sheetid varchar2( 4000 ) path '@sheetId'
-                                      , rid     varchar2( 4000 ) path '@*:id[ namespace-uri(.) =
-                                                                         ( "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-                                                                         , "http://purl.oclc.org/ooxml/officeDocument/relationships"
-                                                                         ) ]'
-                                      , state   varchar2( 4000 ) path '@state' ) xt2
-                 join
-                      xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/package/2006/relationships' )
-                              , '/Relationships/Relationship'
-                                passing xmltype( xmldata => l_workbook_rels, csid => nls_charset_id( 'AL32UTF8' ) )
-                                columns type    varchar2( 4000 ) path '@Type'
-                                      , target  varchar2( 4000 ) path '@Target'
-                                      , id      varchar2( 4000 ) path '@Id' ) xt3
-                 on xt3.id = xt2.rid
-                 order by xt2.sheetid
-               )
-    loop
-      if ( p_sheets is null
-         or instr( ':' || p_sheets || ':', ':' || r_x.seq || ':' ) > 0
-         or instr( ':' || p_sheets || ':', ':' || r_x.name || ':' ) > 0
-         )
-      then
-        for i in 1 .. l_cnt
-        loop
-          exit when not get_central_file_header( p_xlsx, null, i, null, l_cfh );
-          if utl_raw.cast_to_varchar2( l_cfh.name1 ) like '%' || r_x.target
-          then
-            l_file := parse_file( p_xlsx, l_cfh );
-            l_one_cell.sheet_nr   := r_x.seq;
-            l_one_cell.sheet_name := r_x.name;
-            l_one_cell.row_nr     := 0;
-            l_prev_col_nr := 0;
-            l_prev_row_nr := 0;
-            l_null_cell.sheet_nr   := r_x.seq;
-            l_null_cell.sheet_name := r_x.name;
-            for r_c in ( select *
-                         from xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-                                                     , 'http://purl.oclc.org/ooxml/spreadsheetml/main' as "x" )
-                                      , '( /worksheet/sheetData/row/c, /x:worksheet/x:sheetData/x:row/x:c )'
-                                        passing xmltype( xmldata => l_file, csid => l_csid_utf8 )
-                                        columns v varchar2(4000) path '*:v'
-                                              , f varchar2(4000) path '*:f'
-                                              , t varchar2(4000) path '@t'
-                                              , r varchar2(32)   path '@r'
-                                              , s integer        path '@s'
-                                              , rw integer       path './../@r'
-                                              , txt varchar2(4000 char) path 'substring( string-join(.//*:t/text(), "" ), 1, 3900 )'
-                                              , len integer             path 'string-length( string-join(.//*:t/text(), "" ) )'
-                                      )
-                       )
-            loop
-              if p_cell != r_c.r
-              then
-                continue;
-              end if;
-              if r_c.r is null
-              then
-                if l_one_cell.row_nr = r_c.rw
-                then
-                  l_one_cell.col_nr := l_one_cell.col_nr + 1;
-                else
-                  l_one_cell.col_nr := 1;
-                end if;
-              else
-                l_one_cell.col_nr := col_alfan( r_c.r );
-              end if;
-              l_one_cell.row_nr     := coalesce( r_c.rw, l_one_cell.row_nr + 1 );
-              l_one_cell.cell       := r_c.r;
-              l_one_cell.formula    := r_c.f;
-              l_one_cell.string_val := null;
-              l_one_cell.number_val := null;
-              l_one_cell.date_val   := null;
-              l_one_cell.clob_val   := null;
-              l_one_cell.string_len := null;
-              if l_empty_cols
-                 and (   l_one_cell.col_nr > l_prev_col_nr + 1
-                     or (   l_one_cell.col_nr > 1
-                        and l_one_cell.row_nr > l_prev_row_nr
-                        )
-                     )
-              then
-                l_null_cell.row_nr := l_one_cell.row_nr;
-                for n in case
-                           when l_one_cell.col_nr > l_prev_col_nr + 1
-                             then l_prev_col_nr + 1
-                             else 1
-                         end .. l_one_cell.col_nr - 1
-                loop
-                  l_null_cell.col_nr := n;
-                  l_null_cell.cell := alfan_col( n ) || l_null_cell.row_nr;
-                  pipe row( l_null_cell );
-                end loop;
-              end if;
-              if r_c.t = 's'
-              then
-                l_one_cell.cell_type := 'S';
-                if r_c.v is not null
-                then
-                  l_one_cell.string_val := l_strings( to_number( r_c.v ) + 1 );
-                  l_one_cell.string_len := l_string_lens( to_number( r_c.v ) + 1 );
-                  if l_one_cell.string_len > 3900 and substr( p_include_clobs, 1, 1 ) in ( 'Y', 'y', '1' )
-                  then
-                    select xt1.txt
-                    into l_one_cell.clob_val
-                    from xmltable( '/*:sst/*:si[$i]'
-                                   passing xmltype( xmldata => l_shared_strings, csid => l_csid_utf8 )
-                                         , to_number( r_c.v ) + 1 as "i"
-                                   columns txt clob path 'string-join(.//*:t/text(), "" )'
-                                 ) xt1;
-                  end if;
-                  if l_quote_prefix.exists( r_c.s )
-                  then
-                    l_one_cell.string_val := '''' || l_one_cell.string_val;
-                    if l_one_cell.clob_val is not null
-                    then
-                      l_one_cell.clob_val := '''' || l_one_cell.clob_val;
-                    end if;
-                  end if;
-                end if;
-              elsif r_c.t = 'n' or r_c.t is null
-              then
-                l_nr := to_number( r_c.v
-                                 , case when instr( upper( r_c.v ), 'E' ) = 0
-                                     then translate( r_c.v, '.012345678,-+', 'D999999999' )
-                                     else translate( substr( r_c.v, 1, instr( upper( r_c.v ) , 'E' ) - 1 ), '.012345678,-+', 'D999999999' ) || 'EEEE'
-                                   end
-                                 , 'NLS_NUMERIC_CHARACTERS=.,'
-                                 );
-                if l_date_styles.exists( r_c.s )
-                then
-                  l_one_cell.cell_type := 'D';
-                  if lower( r_x.d1904 ) in ( 'true', '1' )
-                  then
-                    l_one_cell.date_val := date '1904-01-01' + l_nr;
-                  else
-                    l_one_cell.date_val := date '1900-03-01' + ( l_nr - case when l_nr < 61 then 60 else 61 end );
-                  end if;
-                elsif l_time_styles.exists( r_c.s )
-                then
-                  l_one_cell.cell_type := 'S';
-                  l_one_cell.string_val := to_char( numtodsinterval(  l_nr, 'day' ) );
-                  l_one_cell.string_len := length( l_one_cell.string_val );
-                else
-                  l_one_cell.cell_type := 'N';
-                  l_nr := round( l_nr, 14 - substr( to_char( l_nr, 'TME' ), -3 ) );
-                  l_one_cell.number_val := l_nr;
-                end if;
-              elsif r_c.t = 'd'
-              then
-                l_one_cell.cell_type := 'D';
-                l_one_cell.date_val := cast( to_timestamp_tz( r_c.v, 'yyyy-mm-dd"T"hh24:mi:ss.ffTZH:TZM' ) as date );
-              elsif r_c.t = 'inlineStr'
-              then
-                l_one_cell.cell_type := 'S';
-                l_one_cell.string_val := r_c.txt;
-                l_one_cell.string_len := r_c.len;
-                if     l_one_cell.string_len > 3900
-                   and substr( p_include_clobs, 1, 1 ) in ( 'Y', 'y', '1' )
-                   and r_c.r is not null
-                then
-                  select xt1.txt
-                  into l_one_cell.clob_val
-                  from xmltable( '/*:worksheet/*:sheetData/*:row/*:c[@r=$r]'
-                                 passing xmltype( xmldata => l_file, csid => l_csid_utf8 )
-                                       , r_c.r as "r"
-                                 columns txt clob path 'string-join(.//*:t/text(), "" )'
-                               ) xt1;
-                end if;
-              elsif r_c.t in ( 'str', 'e' )
-              then
-                l_one_cell.cell_type := 'S';
-                l_one_cell.string_val := r_c.v;
-                l_one_cell.string_len := length( l_one_cell.string_val );
-              elsif r_c.t = 'b'
-              then
-                l_one_cell.cell_type := 'S';
-                l_one_cell.string_val := case r_c.v
-                                           when '1' then 'TRUE'
-                                           when '0' then 'FALSE'
-                                           else r_c.v
-                                        end;
-                l_one_cell.string_len := length( l_one_cell.string_val );
-              end if;
-              pipe row( l_one_cell );
-              l_prev_col_nr := l_one_cell.col_nr;
-              l_prev_row_nr := l_one_cell.row_nr;
-            end loop;
-            dbms_lob.freetemporary( l_file );
-            exit;
-          end if;
-        end loop;
-      end if;
-    end loop;
-    --
-    dbms_lob.freetemporary( l_workbook );
-    dbms_lob.freetemporary( l_workbook_rels );
-    if l_strings is not null
-    then
-      l_strings.delete;
-      l_string_lens.delete;
-      dbms_lob.freetemporary( l_shared_strings );
-    end if;
-    l_date_styles.delete;
-    l_time_styles.delete;
-    l_quote_prefix.delete;
-    raise no_data_needed;
-  end read;
   --
   function get_version
   return varchar2
