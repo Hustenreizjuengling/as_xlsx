@@ -1,4 +1,10 @@
-~~~
+## Usage examples
+
+### Formatting, comments, hyperlinks, merged cells
+
+```sql
+declare
+  l_blob blob;
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
@@ -29,10 +35,15 @@ begin
   as_xlsx.query2sheet( 'select rownum, x.*
 , case when mod( rownum, 2 ) = 0 then rownum * 3 end demo
 , case when mod( rownum, 2 ) = 1 then ''demo '' || rownum end demo2 from dual x connect by rownum <= 5' );
-  as_xlsx.save( 'MY_DIR', 'my.xlsx' );
+  l_blob := as_xlsx.finish;
 end;
-~~~
-~~~
+```
+
+### Data validation (dropdown lists)
+
+```sql
+declare
+  l_blob blob;
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
@@ -54,10 +65,15 @@ begin
     , p_error_title => 'Are you sure?'
     , p_error_txt => 'Valid values are: 13, 15 and 17'
     , p_sheet => 1 );
-  as_xlsx.save( 'MY_DIR', 'my.xlsx' );
+  l_blob := as_xlsx.finish;
 end;
-~~~
-~~~
+```
+
+### Autofilter
+
+```sql
+declare
+  l_blob blob;
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
@@ -70,10 +86,15 @@ begin
   as_xlsx.cell( 2, 7, 3 );
   as_xlsx.cell( 2, 8, 7 );
   as_xlsx.set_autofilter( 2,2, p_row_start => 5, p_row_end => 8 );
-  as_xlsx.save( 'MY_DIR', 'my.xlsx' );
+  l_blob := as_xlsx.finish;
 end;
-~~~
-~~~
+```
+
+### Freeze panes
+
+```sql
+declare
+  l_blob blob;
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
@@ -96,25 +117,30 @@ begin
   as_xlsx.new_sheet;
   as_xlsx.cell( 3, 3, 'Start freeze' );
   as_xlsx.freeze_pane( 3,3 );
-  as_xlsx.save( 'MY_DIR', 'my.xlsx' );
+  l_blob := as_xlsx.finish;
 end;
-~~~
-~~~
-  select *
-  from table( as_xlsx.read( as_xlsx.file2blob( 'MY_DIR', 'test.xlsx' ), '1' ) )
-~~~
-~~~
+```
+
+### Images
+
+```sql
+declare
+  l_blob blob;
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
   as_xlsx.add_image( 1, 1, as_barcode.barcode( 'https://github.com/antonscheffer/as_xlsx', 'QR' ) );
   as_xlsx.cell( 1, 8, 'now with png images' );
-  as_xlsx.save( 'MY_DIR', 'my.xlsx' );
+  l_blob := as_xlsx.finish;
 end;
-~~~
-~~~
+```
+
+### query2sheet with SYS_REFCURSOR and encryption
+
+```sql
 declare
-  l_cnt pls_integer;
+  l_blob  blob;
+  l_cnt   pls_integer;
   l_query sys_refcursor;
 begin
   open l_query for
@@ -143,14 +169,19 @@ begin
   as_xlsx.cell( 5
               , l_cnt
                  + 3  -- query start row
-                 + 2  -- title + headers 
-                 + 1  -- interval 
+                 + 2  -- title + headers
+                 + 1  -- interval
               , 'Rows returned: ' || l_cnt );
   -- make sure you have set as_xlsx.use_dbms_crypto = true; in the package specification
-  as_xlsx.save( 'MY_DIR', 'my.xlsx', 'demo' );
+  l_blob := as_xlsx.finish( 'demo' );
 end;
-~~~
-~~~
+```
+
+### Formulas
+
+```sql
+declare
+  l_blob blob;
 begin
   as_xlsx.clear_workbook;
   as_xlsx.new_sheet;
@@ -169,7 +200,6 @@ begin
   as_xlsx.num_formula( 2, 1, 'A6+B6' );
   as_xlsx.num_formula( 2, 6, 'SUM(A1:A5)' );
   as_xlsx.num_formula( 1, 6, 'SUM(A1:A2)' );
-  as_xlsx.save( 'MY_DIR', 'my.xlsx' );
+  l_blob := as_xlsx.finish;
 end;
-~~~
-
+```
