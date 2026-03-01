@@ -1,9 +1,9 @@
-create or replace package body as_xlsx
+create or replace package body pck_as_xlsx
 is
   --------------------------------------------------------------------------
   -- Constants
   --------------------------------------------------------------------------
-  c_version constant varchar2(20) := 'as_xlsx60';
+  c_version constant varchar2(20) := 'pck_as_xlsx60';
 
   -- ZIP format signatures
   c_lob_duration constant pls_integer := dbms_lob.call;
@@ -1572,11 +1572,11 @@ is
   --------------------------------------------------------------------------
   -- Encryption (conditional compilation)
   --
-  -- Only compiled when as_xlsx.use_dbms_crypto = true in the spec.
+  -- Only compiled when pck_as_xlsx.use_dbms_crypto = true in the spec.
   -- Implements ECMA-376 Agile Encryption using AES-256-CBC and SHA-1,
   -- wrapped in a Compound File Binary (CFB) container.
   --------------------------------------------------------------------------
-$IF as_xlsx.use_dbms_crypto
+$IF pck_as_xlsx.use_dbms_crypto
 $THEN
   function excel_encrypt( p_xlsx blob, p_password varchar2 )
   return blob
@@ -3075,7 +3075,7 @@ style="position:absolute;margin-left:35.25pt;margin-top:3pt;z-index:' || to_char
     build_shared_strings( l_excel );
     finish_zip( l_excel );
     clear_workbook;
-$IF as_xlsx.use_dbms_crypto
+$IF pck_as_xlsx.use_dbms_crypto
 $THEN
     if p_password is not null
     then
@@ -3595,5 +3595,5 @@ $END
     return c_version;
   end get_version;
   --
-end as_xlsx;
+end pck_as_xlsx;
 /

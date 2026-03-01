@@ -1,4 +1,4 @@
-# as_xlsx
+# pck_as_xlsx
 
 Oracle PL/SQL package for generating Excel `.xlsx` files directly from the database, returned as `BLOB`.
 
@@ -25,13 +25,13 @@ Oracle PL/SQL package for generating Excel `.xlsx` files directly from the datab
 Compile both files on your Oracle database in order:
 
 ```sql
-@src/as_xlsx.pks
-@src/as_xlsx.pkb
+@src/pck_as_xlsx.pks
+@src/pck_as_xlsx.pkb
 ```
 
 ### Encryption (optional)
 
-To enable password-protected XLSX output, set the constant in `as_xlsx.pks` before compiling:
+To enable password-protected XLSX output, set the constant in `pck_as_xlsx.pks` before compiling:
 
 ```sql
 use_dbms_crypto constant boolean := true;
@@ -47,12 +47,12 @@ This requires the `DBMS_CRYPTO` package grant.
 declare
   l_blob blob;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet('Demo');
-  as_xlsx.cell(1, 1, 'Hello');
-  as_xlsx.cell(2, 1, 42);
-  as_xlsx.cell(3, 1, sysdate, p_numFmtId => as_xlsx.get_numFmt('dd/mm/yyyy'));
-  l_blob := as_xlsx.finish;
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet('Demo');
+  pck_as_xlsx.cell(1, 1, 'Hello');
+  pck_as_xlsx.cell(2, 1, 42);
+  pck_as_xlsx.cell(3, 1, sysdate, p_numFmtId => pck_as_xlsx.get_numFmt('dd/mm/yyyy'));
+  l_blob := pck_as_xlsx.finish;
   -- use l_blob: store it, return via web, etc.
 end;
 ```
@@ -63,16 +63,16 @@ end;
 declare
   l_blob blob;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet;
-  as_xlsx.cell(1, 1, 'Bold red',
-    p_fontId => as_xlsx.get_font('Calibri', p_bold => true, p_rgb => 'FFFF0000'));
-  as_xlsx.cell(1, 2, 'Wrapped text',
-    p_alignment => as_xlsx.get_alignment(p_wraptext => true));
-  as_xlsx.cell(2, 1, 100,
-    p_borderId => as_xlsx.get_border('double', 'double', 'double', 'double'));
-  as_xlsx.set_column_width(1, 20);
-  l_blob := as_xlsx.finish;
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet;
+  pck_as_xlsx.cell(1, 1, 'Bold red',
+    p_fontId => pck_as_xlsx.get_font('Calibri', p_bold => true, p_rgb => 'FFFF0000'));
+  pck_as_xlsx.cell(1, 2, 'Wrapped text',
+    p_alignment => pck_as_xlsx.get_alignment(p_wraptext => true));
+  pck_as_xlsx.cell(2, 1, 100,
+    p_borderId => pck_as_xlsx.get_border('double', 'double', 'double', 'double'));
+  pck_as_xlsx.set_column_width(1, 20);
+  l_blob := pck_as_xlsx.finish;
 end;
 ```
 
@@ -83,14 +83,14 @@ declare
   l_blob blob;
   l_cnt  pls_integer;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet('Report');
-  l_cnt := as_xlsx.query2sheet(
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet('Report');
+  l_cnt := pck_as_xlsx.query2sheet(
     p_sql        => 'select employee_id, first_name, hire_date from employees',
     p_autofilter => true,
     p_date_format => 'yyyy-mm-dd'
   );
-  l_blob := as_xlsx.finish;
+  l_blob := pck_as_xlsx.finish;
 end;
 ```
 
@@ -100,16 +100,16 @@ end;
 declare
   l_blob blob;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet;
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet;
   for c in 1 .. 10 loop
-    as_xlsx.cell(c, 1, 'COL' || c);
-    as_xlsx.cell(c, 2, 'val' || c);
-    as_xlsx.cell(c, 3, c);
+    pck_as_xlsx.cell(c, 1, 'COL' || c);
+    pck_as_xlsx.cell(c, 2, 'val' || c);
+    pck_as_xlsx.cell(c, 3, c);
   end loop;
-  as_xlsx.freeze_rows(1);
-  as_xlsx.set_autofilter(1, 10, 1, 3);
-  l_blob := as_xlsx.finish;
+  pck_as_xlsx.freeze_rows(1);
+  pck_as_xlsx.set_autofilter(1, 10, 1, 3);
+  l_blob := pck_as_xlsx.finish;
 end;
 ```
 
@@ -119,15 +119,15 @@ end;
 declare
   l_blob blob;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet;
-  as_xlsx.cell(1, 1, 3);
-  as_xlsx.cell(1, 2, 5);
-  as_xlsx.cell(1, 3, 4);
-  as_xlsx.num_formula(2, 1, 'SUM(A1:A3)');
-  as_xlsx.date_formula(3, 1, 'TODAY()', p_numFmtId => as_xlsx.get_numFmt('yyyy-mm-dd'));
-  as_xlsx.str_formula(4, 1, 'LOWER(TEXT(TODAY(),"DDDD"))');
-  l_blob := as_xlsx.finish;
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet;
+  pck_as_xlsx.cell(1, 1, 3);
+  pck_as_xlsx.cell(1, 2, 5);
+  pck_as_xlsx.cell(1, 3, 4);
+  pck_as_xlsx.num_formula(2, 1, 'SUM(A1:A3)');
+  pck_as_xlsx.date_formula(3, 1, 'TODAY()', p_numFmtId => pck_as_xlsx.get_numFmt('yyyy-mm-dd'));
+  pck_as_xlsx.str_formula(4, 1, 'LOWER(TEXT(TODAY(),"DDDD"))');
+  l_blob := pck_as_xlsx.finish;
 end;
 ```
 
@@ -137,14 +137,14 @@ end;
 declare
   l_blob blob;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet;
-  as_xlsx.cell(1, 1, 'A');
-  as_xlsx.cell(1, 2, 'B');
-  as_xlsx.cell(1, 3, 'C');
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet;
+  pck_as_xlsx.cell(1, 1, 'A');
+  pck_as_xlsx.cell(1, 2, 'B');
+  pck_as_xlsx.cell(1, 3, 'C');
   -- dropdown at B1 referencing A1:A3
-  as_xlsx.list_validation(2, 1, 1, 1, 1, 3, p_show_error => true);
-  l_blob := as_xlsx.finish;
+  pck_as_xlsx.list_validation(2, 1, 1, 1, 1, 3, p_show_error => true);
+  l_blob := pck_as_xlsx.finish;
 end;
 ```
 
@@ -154,10 +154,10 @@ end;
 declare
   l_blob blob;
 begin
-  as_xlsx.clear_workbook;
-  as_xlsx.new_sheet;
-  as_xlsx.add_image(1, 1, my_image_blob, p_name => 'logo');
-  l_blob := as_xlsx.finish;
+  pck_as_xlsx.clear_workbook;
+  pck_as_xlsx.new_sheet;
+  pck_as_xlsx.add_image(1, 1, my_image_blob, p_name => 'logo');
+  l_blob := pck_as_xlsx.finish;
 end;
 ```
 

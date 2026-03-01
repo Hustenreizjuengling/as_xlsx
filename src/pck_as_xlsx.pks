@@ -1,4 +1,4 @@
-create or replace package as_xlsx
+create or replace package pck_as_xlsx
 is
   -------------------------------------------------------------------------------
   -- AS_XLSX - Oracle PL/SQL XLSX Generator (Write-Only)
@@ -105,9 +105,9 @@ is
    * @return            The complete XLSX file as BLOB
    *
    * Example:
-   *   as_xlsx.new_sheet('Demo');
-   *   as_xlsx.cell(1, 1, 'Hello World');
-   *   l_blob := as_xlsx.finish;
+   *   pck_as_xlsx.new_sheet('Demo');
+   *   pck_as_xlsx.cell(1, 1, 'Hello World');
+   *   l_blob := pck_as_xlsx.finish;
    */
   function finish
     ( p_password varchar2 := null
@@ -730,5 +730,5 @@ is
   function get_version
   return varchar2;
 
-end as_xlsx;
+end pck_as_xlsx;
 /
