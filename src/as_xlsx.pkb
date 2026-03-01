@@ -1,13 +1,19 @@
 create or replace package body as_xlsx
 is
-  --
+  --------------------------------------------------------------------------
+  -- Constants
+  --------------------------------------------------------------------------
   c_version constant varchar2(20) := 'as_xlsx60';
---
+
+  -- ZIP format signatures
   c_lob_duration constant pls_integer := dbms_lob.call;
-  c_LOCAL_FILE_HEADER        constant raw(4) := hextoraw( '504B0304' ); -- Local file header signature
-  c_CENTRAL_FILE_HEADER      constant raw(4) := hextoraw( '504B0102' ); -- Central directory file header signature
-  c_END_OF_CENTRAL_DIRECTORY constant raw(4) := hextoraw( '504B0506' ); -- End of central directory signature
---
+  c_LOCAL_FILE_HEADER        constant raw(4) := hextoraw( '504B0304' );
+  c_CENTRAL_FILE_HEADER      constant raw(4) := hextoraw( '504B0102' );
+  c_END_OF_CENTRAL_DIRECTORY constant raw(4) := hextoraw( '504B0506' );
+
+  --------------------------------------------------------------------------
+  -- Private type declarations
+  --------------------------------------------------------------------------
   type tp_XF_fmt is record
     ( numFmtId pls_integer
     , fontId pls_integer
@@ -170,9 +176,19 @@ is
     , tables        tp_tables
     );
   workbook tp_book;
-  --
+
+  --------------------------------------------------------------------------
+  -- Package state
+  --------------------------------------------------------------------------
   g_useXf boolean := true;
+
+  --------------------------------------------------------------------------
+  -- UTF-8 blob buffered-write utilities
   --
+  -- Accumulates text fragments in a VARCHAR2 buffer and flushes to a BLOB
+  -- only when the buffer overflows. This dramatically reduces the number of
+  -- dbms_lob.writeappend calls when building large XML documents.
+  --------------------------------------------------------------------------
   g_addtxt2utf8blob_tmp varchar2(32767);
   procedure addtxt2utf8blob_init( p_blob in out nocopy blob )
   is
@@ -182,17 +198,17 @@ is
   end;
   procedure addtxt2utf8blob_finish( p_blob in out nocopy blob )
   is
-    t_raw raw(32767);
+    l_raw raw(32767);
   begin
-    t_raw := utl_i18n.string_to_raw( g_addtxt2utf8blob_tmp, 'AL32UTF8' );
-    dbms_lob.writeappend( p_blob, utl_raw.length( t_raw ), t_raw );
+    l_raw := utl_i18n.string_to_raw( g_addtxt2utf8blob_tmp, 'AL32UTF8' );
+    dbms_lob.writeappend( p_blob, utl_raw.length( l_raw ), l_raw );
   exception
     when value_error
     then
-      t_raw := utl_i18n.string_to_raw( substr( g_addtxt2utf8blob_tmp, 1, 16381 ), 'AL32UTF8' );
-      dbms_lob.writeappend( p_blob, utl_raw.length( t_raw ), t_raw );
-      t_raw := utl_i18n.string_to_raw( substr( g_addtxt2utf8blob_tmp, 16382 ), 'AL32UTF8' );
-      dbms_lob.writeappend( p_blob, utl_raw.length( t_raw ), t_raw );
+      l_raw := utl_i18n.string_to_raw( substr( g_addtxt2utf8blob_tmp, 1, 16381 ), 'AL32UTF8' );
+      dbms_lob.writeappend( p_blob, utl_raw.length( l_raw ), l_raw );
+      l_raw := utl_i18n.string_to_raw( substr( g_addtxt2utf8blob_tmp, 16382 ), 'AL32UTF8' );
+      dbms_lob.writeappend( p_blob, utl_raw.length( l_raw ), l_raw );
   end;
   procedure addtxt2utf8blob( p_txt varchar2, p_blob in out nocopy blob )
   is
@@ -204,8 +220,12 @@ is
       addtxt2utf8blob_finish( p_blob );
       g_addtxt2utf8blob_tmp := p_txt;
   end;
---
---
+
+  --------------------------------------------------------------------------
+  -- Low-level helpers
+  --------------------------------------------------------------------------
+
+  -- Converts a number to a little-endian RAW of p_bytes length.
   function little_endian( p_big number, p_bytes pls_integer := 4 )
   return raw
   is
@@ -217,106 +237,119 @@ is
       return utl_raw.reverse( to_char( p_big, substr( 'fm0XXXXXXXXXXXXXXXXXXX', 1, 2 + 2 * p_bytes ) ) );
     end if;
   end;
-  --
+
+  -- Reads p_len bytes at position p_pos from a BLOB as a little-endian integer.
   function blob2num( p_blob blob, p_len integer, p_pos integer )
   return number
   is
   begin
     return utl_raw.cast_to_binary_integer( dbms_lob.substr( p_blob, p_len, p_pos ), utl_raw.little_endian );
   end;
---
+
+  --------------------------------------------------------------------------
+  -- ZIP archive procedures
+  --
+  -- Build a ZIP archive incrementally. add1file appends one file entry,
+  -- finish_zip writes the central directory and end-of-central-directory
+  -- record.  Together they produce a valid ZIP (PKZIP 2.0) container.
+  --------------------------------------------------------------------------
+
+  -- Appends a single file to the ZIP archive BLOB.
+  -- Compresses with DEFLATE when beneficial, otherwise stores raw.
   procedure add1file
     ( p_zipped_blob in out blob
     , p_name varchar2
     , p_content blob
     )
   is
-    t_now date;
-    t_blob blob;
-    t_len integer;
-    t_clen integer;
-    t_crc32 raw(4) := hextoraw( '00000000' );
-    t_compressed boolean := false;
-    t_name raw(32767);
+    l_now date;
+    l_blob blob;
+    l_len integer;
+    l_clen integer;
+    l_crc32 raw(4) := hextoraw( '00000000' );
+    l_compressed boolean := false;
+    l_name raw(32767);
   begin
-    t_now := sysdate;
-    t_len := nvl( dbms_lob.getlength( p_content ), 0 );
-    if t_len > 0
+    l_now := sysdate;
+    l_len := nvl( dbms_lob.getlength( p_content ), 0 );
+    if l_len > 0
     then
-      t_blob := utl_compress.lz_compress( p_content );
-      t_clen := dbms_lob.getlength( t_blob ) - 18;
-      t_compressed := t_clen < t_len;
-      t_crc32 := dbms_lob.substr( t_blob, 4, t_clen + 11 );
+      l_blob := utl_compress.lz_compress( p_content );
+      l_clen := dbms_lob.getlength( l_blob ) - 18;
+      l_compressed := l_clen < l_len;
+      l_crc32 := dbms_lob.substr( l_blob, 4, l_clen + 11 );
     end if;
-    if not t_compressed
+    if not l_compressed
     then
-      t_clen := t_len;
-      t_blob := p_content;
+      l_clen := l_len;
+      l_blob := p_content;
     end if;
     if p_zipped_blob is null
     then
       dbms_lob.createtemporary( p_zipped_blob, true );
     end if;
-    t_name := utl_i18n.string_to_raw( p_name, 'AL32UTF8' );
+    l_name := utl_i18n.string_to_raw( p_name, 'AL32UTF8' );
     dbms_lob.append( p_zipped_blob
                    , utl_raw.concat( c_LOCAL_FILE_HEADER -- Local file header signature
                                    , hextoraw( '1400' )  -- version 2.0
-                                   , case when t_name = utl_i18n.string_to_raw( p_name, 'US8PC437' )
+                                   , case when l_name = utl_i18n.string_to_raw( p_name, 'US8PC437' )
                                        then hextoraw( '0000' ) -- no General purpose bits
                                        else hextoraw( '0008' ) -- set Language encoding flag (EFS)
                                      end
-                                   , case when t_compressed
+                                   , case when l_compressed
                                         then hextoraw( '0800' ) -- deflate
                                         else hextoraw( '0000' ) -- stored
                                      end
-                                   , little_endian( to_number( to_char( t_now, 'ss' ) ) / 2
-                                                  + to_number( to_char( t_now, 'mi' ) ) * 32
-                                                  + to_number( to_char( t_now, 'hh24' ) ) * 2048
+                                   , little_endian( to_number( to_char( l_now, 'ss' ) ) / 2
+                                                  + to_number( to_char( l_now, 'mi' ) ) * 32
+                                                  + to_number( to_char( l_now, 'hh24' ) ) * 2048
                                                   , 2
                                                   ) -- File last modification time
-                                   , little_endian( to_number( to_char( t_now, 'dd' ) )
-                                                  + to_number( to_char( t_now, 'mm' ) ) * 32
-                                                  + ( to_number( to_char( t_now, 'yyyy' ) ) - 1980 ) * 512
+                                   , little_endian( to_number( to_char( l_now, 'dd' ) )
+                                                  + to_number( to_char( l_now, 'mm' ) ) * 32
+                                                  + ( to_number( to_char( l_now, 'yyyy' ) ) - 1980 ) * 512
                                                   , 2
                                                   ) -- File last modification date
-                                   , t_crc32 -- CRC-32
-                                   , little_endian( t_clen )                      -- compressed size
-                                   , little_endian( t_len )                       -- uncompressed size
-                                   , little_endian( utl_raw.length( t_name ), 2 ) -- File name length
+                                   , l_crc32 -- CRC-32
+                                   , little_endian( l_clen )                      -- compressed size
+                                   , little_endian( l_len )                       -- uncompressed size
+                                   , little_endian( utl_raw.length( l_name ), 2 ) -- File name length
                                    , hextoraw( '0000' )                           -- Extra field length
-                                   , t_name                                       -- File name
+                                   , l_name                                       -- File name
                                    )
                    );
-    if t_compressed
+    if l_compressed
     then
-      dbms_lob.copy( p_zipped_blob, t_blob, t_clen, dbms_lob.getlength( p_zipped_blob ) + 1, 11 ); -- compressed content
-    elsif t_clen > 0
+      dbms_lob.copy( p_zipped_blob, l_blob, l_clen, dbms_lob.getlength( p_zipped_blob ) + 1, 11 ); -- compressed content
+    elsif l_clen > 0
     then
-      dbms_lob.copy( p_zipped_blob, t_blob, t_clen, dbms_lob.getlength( p_zipped_blob ) + 1, 1 ); --  content
+      dbms_lob.copy( p_zipped_blob, l_blob, l_clen, dbms_lob.getlength( p_zipped_blob ) + 1, 1 ); --  content
     end if;
-    if dbms_lob.istemporary( t_blob ) = 1
+    if dbms_lob.istemporary( l_blob ) = 1
     then
-      dbms_lob.freetemporary( t_blob );
+      dbms_lob.freetemporary( l_blob );
     end if;
   end;
---
+
+  -- Finalises the ZIP archive by writing the central directory and
+  -- end-of-central-directory record.
   procedure finish_zip( p_zipped_blob in out blob )
   is
-    t_cnt pls_integer := 0;
-    t_offs integer;
-    t_offs_dir_header integer;
-    t_offs_end_header integer;
-    t_comment raw(32767) := utl_raw.cast_to_raw( 'Implementation by Anton Scheffer, ' || c_version );
+    l_cnt pls_integer := 0;
+    l_offs integer;
+    l_offs_dir_header integer;
+    l_offs_end_header integer;
+    l_comment raw(32767) := utl_raw.cast_to_raw( 'Implementation by Anton Scheffer, ' || c_version );
   begin
-    t_offs_dir_header := dbms_lob.getlength( p_zipped_blob );
-    t_offs := 1;
-    while dbms_lob.substr( p_zipped_blob, utl_raw.length( c_LOCAL_FILE_HEADER ), t_offs ) = c_LOCAL_FILE_HEADER
+    l_offs_dir_header := dbms_lob.getlength( p_zipped_blob );
+    l_offs := 1;
+    while dbms_lob.substr( p_zipped_blob, utl_raw.length( c_LOCAL_FILE_HEADER ), l_offs ) = c_LOCAL_FILE_HEADER
     loop
-      t_cnt := t_cnt + 1;
+      l_cnt := l_cnt + 1;
       dbms_lob.append( p_zipped_blob
                      , utl_raw.concat( hextoraw( '504B0102' )      -- Central directory file header signature
                                      , hextoraw( '1400' )          -- version 2.0
-                                     , dbms_lob.substr( p_zipped_blob, 26, t_offs + 4 )
+                                     , dbms_lob.substr( p_zipped_blob, 26, l_offs + 4 )
                                      , hextoraw( '0000' )          -- File comment length
                                      , hextoraw( '0000' )          -- Disk number where file starts
                                      , hextoraw( '0000' )          -- Internal file attributes =>
@@ -325,39 +358,44 @@ is
                                      , case
                                          when dbms_lob.substr( p_zipped_blob
                                                              , 1
-                                                             , t_offs + 30 + blob2num( p_zipped_blob, 2, t_offs + 26 ) - 1
+                                                             , l_offs + 30 + blob2num( p_zipped_blob, 2, l_offs + 26 ) - 1
                                                              ) in ( hextoraw( '2F' ) -- /
                                                                   , hextoraw( '5C' ) -- \
                                                                   )
                                          then hextoraw( '10000000' ) -- a directory/folder
                                          else hextoraw( '2000B681' ) -- a file
                                        end                         -- External file attributes
-                                     , little_endian( t_offs - 1 ) -- Relative offset of local file header
+                                     , little_endian( l_offs - 1 ) -- Relative offset of local file header
                                      , dbms_lob.substr( p_zipped_blob
-                                                      , blob2num( p_zipped_blob, 2, t_offs + 26 )
-                                                      , t_offs + 30
+                                                      , blob2num( p_zipped_blob, 2, l_offs + 26 )
+                                                      , l_offs + 30
                                                       )            -- File name
                                      )
                      );
-      t_offs := t_offs + 30 + blob2num( p_zipped_blob, 4, t_offs + 18 )  -- compressed size
-                            + blob2num( p_zipped_blob, 2, t_offs + 26 )  -- File name length
-                            + blob2num( p_zipped_blob, 2, t_offs + 28 ); -- Extra field length
+      l_offs := l_offs + 30 + blob2num( p_zipped_blob, 4, l_offs + 18 )  -- compressed size
+                             + blob2num( p_zipped_blob, 2, l_offs + 26 )  -- File name length
+                             + blob2num( p_zipped_blob, 2, l_offs + 28 ); -- Extra field length
     end loop;
-    t_offs_end_header := dbms_lob.getlength( p_zipped_blob );
+    l_offs_end_header := dbms_lob.getlength( p_zipped_blob );
     dbms_lob.append( p_zipped_blob
-                   , utl_raw.concat( c_END_OF_CENTRAL_DIRECTORY                                -- End of central directory signature
-                                   , hextoraw( '0000' )                                        -- Number of this disk
-                                   , hextoraw( '0000' )                                        -- Disk where central directory starts
-                                   , little_endian( t_cnt, 2 )                                 -- Number of central directory records on this disk
-                                   , little_endian( t_cnt, 2 )                                 -- Total number of central directory records
-                                   , little_endian( t_offs_end_header - t_offs_dir_header )    -- Size of central directory
-                                   , little_endian( t_offs_dir_header )                        -- Offset of start of central directory, relative to start of archive
-                                   , little_endian( nvl( utl_raw.length( t_comment ), 0 ), 2 ) -- ZIP file comment length
-                                   , t_comment
+                   , utl_raw.concat( c_END_OF_CENTRAL_DIRECTORY                                  -- End of central directory signature
+                                   , hextoraw( '0000' )                                          -- Number of this disk
+                                   , hextoraw( '0000' )                                          -- Disk where central directory starts
+                                   , little_endian( l_cnt, 2 )                                   -- Number of central directory records on this disk
+                                   , little_endian( l_cnt, 2 )                                   -- Total number of central directory records
+                                   , little_endian( l_offs_end_header - l_offs_dir_header )      -- Size of central directory
+                                   , little_endian( l_offs_dir_header )                          -- Offset of start of central directory, relative to start of archive
+                                   , little_endian( nvl( utl_raw.length( l_comment ), 0 ), 2 )   -- ZIP file comment length
+                                   , l_comment
                                    )
                    );
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Column name helper
+  --------------------------------------------------------------------------
+
+  -- Converts a 1-based column index to an Excel column letter (A, B, ..., Z, AA, AB, ...).
   function alfan_col( p_col pls_integer )
   return varchar2
   is
@@ -368,33 +406,39 @@ is
              else chr( 64 + p_col )
            end;
   end;
-  --
-  --
+
+  --------------------------------------------------------------------------
+  -- Workbook management
+  --------------------------------------------------------------------------
+
+  -- Resets all workbook state: sheets, strings, fonts, fills, borders,
+  -- number formats, cell styles, defined names, tables, and images.
+  -- Must be called before building a new workbook.
   procedure clear_workbook
   is
-    s pls_integer;
-    t_row_ind pls_integer;
+    l_sheet pls_integer;
+    l_row_ind pls_integer;
   begin
-    s := workbook.sheets.first;
-    while s is not null
+    l_sheet := workbook.sheets.first;
+    while l_sheet is not null
     loop
-      t_row_ind := workbook.sheets( s ).rows.first;
-      while t_row_ind is not null
+      l_row_ind := workbook.sheets( l_sheet ).rows.first;
+      while l_row_ind is not null
       loop
-        workbook.sheets( s ).rows( t_row_ind ).delete;
-        t_row_ind := workbook.sheets( s ).rows.next( t_row_ind );
+        workbook.sheets( l_sheet ).rows( l_row_ind ).delete;
+        l_row_ind := workbook.sheets( l_sheet ).rows.next( l_row_ind );
       end loop;
-      workbook.sheets( s ).rows.delete;
-      workbook.sheets( s ).widths.delete;
-      workbook.sheets( s ).autofilters.delete;
-      workbook.sheets( s ).hyperlinks.delete;
-      workbook.sheets( s ).col_fmts.delete;
-      workbook.sheets( s ).row_fmts.delete;
-      workbook.sheets( s ).comments.delete;
-      workbook.sheets( s ).mergecells.delete;
-      workbook.sheets( s ).validations.delete;
-      workbook.sheets( s ).drawings.delete;
-      s := workbook.sheets.next( s );
+      workbook.sheets( l_sheet ).rows.delete;
+      workbook.sheets( l_sheet ).widths.delete;
+      workbook.sheets( l_sheet ).autofilters.delete;
+      workbook.sheets( l_sheet ).hyperlinks.delete;
+      workbook.sheets( l_sheet ).col_fmts.delete;
+      workbook.sheets( l_sheet ).row_fmts.delete;
+      workbook.sheets( l_sheet ).comments.delete;
+      workbook.sheets( l_sheet ).mergecells.delete;
+      workbook.sheets( l_sheet ).validations.delete;
+      workbook.sheets( l_sheet ).drawings.delete;
+      l_sheet := workbook.sheets.next( l_sheet );
     end loop;
     workbook.strings.delete;
     workbook.str_ind.delete;
@@ -413,17 +457,21 @@ is
     authors.delete;
     workbook := null;
   end;
---
+
+  -- Sets the worksheet tab color (hex ARGB value).
   procedure set_tabcolor
     ( p_tabcolor varchar2 -- this is a hex ALPHA Red Green Blue value
     , p_sheet pls_integer := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    workbook.sheets( t_sheet ).tabcolor := substr( p_tabcolor, 1, 8 );
+    workbook.sheets( l_sheet ).tabcolor := substr( p_tabcolor, 1, 8 );
   end;
---
+
+  -- Adds a new worksheet to the workbook.
+  -- Initialises default font (Calibri), fills (none, gray125), and border if
+  -- this is the first sheet.
   procedure new_sheet
     ( p_sheetname      varchar2    := null
     , p_tabcolor       varchar2    := null -- this is a hex ALPHA Red Green Blue value
@@ -432,41 +480,47 @@ is
     , p_show_headers   boolean     := null
     )
   is
-    t_nr pls_integer := workbook.sheets.count + 1;
-    t_ind pls_integer;
+    l_nr pls_integer := workbook.sheets.count + 1;
+    l_ind pls_integer;
   begin
-    workbook.sheets( t_nr ).name := nvl( dbms_xmlgen.convert( translate( p_sheetname, 'a/\[]*:?', 'a' ) ), 'Sheet' || t_nr );
-    workbook.sheets( t_nr ).show_gridlines := p_show_gridlines;
-    workbook.sheets( t_nr ).grid_color_idx := p_grid_color_idx;
-    workbook.sheets( t_nr ).show_headers   := p_show_headers;
+    workbook.sheets( l_nr ).name := nvl( dbms_xmlgen.convert( translate( p_sheetname, 'a/\[]*:?', 'a' ) ), 'Sheet' || l_nr );
+    workbook.sheets( l_nr ).show_gridlines := p_show_gridlines;
+    workbook.sheets( l_nr ).grid_color_idx := p_grid_color_idx;
+    workbook.sheets( l_nr ).show_headers   := p_show_headers;
     if workbook.strings.count = 0
     then
      workbook.str_cnt := 0;
     end if;
     if workbook.fonts.count = 0
     then
-      t_ind := get_font( 'Calibri' );
+      l_ind := get_font( 'Calibri' );
     end if;
     if workbook.fills.count = 0
     then
-      t_ind := get_fill( 'none' );
-      t_ind := get_fill( 'gray125' );
+      l_ind := get_fill( 'none' );
+      l_ind := get_fill( 'gray125' );
     end if;
     if workbook.borders.count = 0
     then
-      t_ind := get_border( '', '', '', '' );
+      l_ind := get_border( '', '', '', '' );
     end if;
-    set_tabcolor( p_tabcolor, t_nr );
+    set_tabcolor( p_tabcolor, l_nr );
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Column width helper
+  --------------------------------------------------------------------------
+
+  -- Auto-calculates and sets column width based on the number format string.
+  -- Uses character count approximation assuming 11pt Calibri.
   procedure set_col_width
     ( p_sheet pls_integer
     , p_col pls_integer
     , p_format varchar2
     )
   is
-    t_width number;
-    t_nr_chr pls_integer;
+    l_width number;
+    l_nr_chr pls_integer;
   begin
     if p_format is null
     then
@@ -474,72 +528,87 @@ is
     end if;
     if instr( p_format, ';' ) > 0
     then
-      t_nr_chr := length( translate( substr( p_format, 1, instr( p_format, ';' ) - 1 ), 'a\"', 'a' ) );
+      l_nr_chr := length( translate( substr( p_format, 1, instr( p_format, ';' ) - 1 ), 'a\"', 'a' ) );
     else
-      t_nr_chr := length( translate( p_format, 'a\"', 'a' ) );
+      l_nr_chr := length( translate( p_format, 'a\"', 'a' ) );
     end if;
-    t_width := trunc( ( t_nr_chr * 7 + 5 ) / 7 * 256 ) / 256; -- assume default 11 point Calibri
+    l_width := trunc( ( l_nr_chr * 7 + 5 ) / 7 * 256 ) / 256; -- assume default 11 point Calibri
     if workbook.sheets( p_sheet ).widths.exists( p_col )
     then
       workbook.sheets( p_sheet ).widths( p_col ) :=
         greatest( workbook.sheets( p_sheet ).widths( p_col )
-                , t_width
+                , l_width
                 );
     else
-      workbook.sheets( p_sheet ).widths( p_col ) := greatest( t_width, 8.43 );
+      workbook.sheets( p_sheet ).widths( p_col ) := greatest( l_width, 8.43 );
     end if;
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Format registration
+  --
+  -- Functions that register and de-duplicate formatting objects (number
+  -- formats, fonts, fills, borders, alignments, cell styles) in the
+  -- workbook.  Each returns an index that can be passed to cell() or
+  -- other APIs.
+  --------------------------------------------------------------------------
+
+  -- Converts an Oracle date format mask to its Excel equivalent.
   function OraFmt2Excel( p_format varchar2 := null )
   return varchar2
   is
-    t_format varchar2(1000) := substr( p_format, 1, 1000 );
+    l_format varchar2(1000) := substr( p_format, 1, 1000 );
   begin
-    t_format := replace( replace( t_format, 'hh24', 'hh' ), 'hh12', 'hh' );
-    t_format := replace( t_format, 'mi', 'mm' );
-    t_format := replace( replace( replace( t_format, 'AM', '~~' ), 'PM', '~~' ), '~~', 'AM/PM' );
-    t_format := replace( replace( replace( t_format, 'am', '~~' ), 'pm', '~~' ), '~~', 'AM/PM' );
-    t_format := replace( replace( t_format, 'day', 'DAY' ), 'DAY', 'dddd' );
-    t_format := replace( replace( t_format, 'dy', 'DY' ), 'DAY', 'ddd' );
-    t_format := replace( replace( t_format, 'RR', 'RR' ), 'RR', 'YY' );
-    t_format := replace( replace( t_format, 'month', 'MONTH' ), 'MONTH', 'mmmm' );
-    t_format := replace( replace( t_format, 'mon', 'MON' ), 'MON', 'mmm' );
-    t_format := replace( t_format, '9', '#' );
-    t_format := replace( t_format, 'D', '.' );
-    t_format := replace( t_format, 'G', ',' );
-    return t_format;
+    l_format := replace( replace( l_format, 'hh24', 'hh' ), 'hh12', 'hh' );
+    l_format := replace( l_format, 'mi', 'mm' );
+    l_format := replace( replace( replace( l_format, 'AM', '~~' ), 'PM', '~~' ), '~~', 'AM/PM' );
+    l_format := replace( replace( replace( l_format, 'am', '~~' ), 'pm', '~~' ), '~~', 'AM/PM' );
+    l_format := replace( replace( l_format, 'day', 'DAY' ), 'DAY', 'dddd' );
+    l_format := replace( replace( l_format, 'dy', 'DY' ), 'DAY', 'ddd' );
+    l_format := replace( replace( l_format, 'RR', 'RR' ), 'RR', 'YY' );
+    l_format := replace( replace( l_format, 'month', 'MONTH' ), 'MONTH', 'mmmm' );
+    l_format := replace( replace( l_format, 'mon', 'MON' ), 'MON', 'mmm' );
+    l_format := replace( l_format, '9', '#' );
+    l_format := replace( l_format, 'D', '.' );
+    l_format := replace( l_format, 'G', ',' );
+    return l_format;
   end;
---
+
+  -- Registers a custom number format and returns its numFmtId.
+  -- Returns 0 when p_format is NULL (= General).
+  -- De-duplicates: returns existing ID if format already registered.
   function get_numFmt( p_format varchar2 := null )
   return pls_integer
   is
-    t_cnt pls_integer;
-    t_numFmtId pls_integer;
+    l_cnt pls_integer;
+    l_numFmtId pls_integer;
   begin
     if p_format is null
     then
       return 0;
     end if;
-    t_cnt := workbook.numFmts.count;
-    for i in 1 .. t_cnt
+    l_cnt := workbook.numFmts.count;
+    for i in 1 .. l_cnt
     loop
       if workbook.numFmts( i ).formatCode = p_format
       then
-        t_numFmtId := workbook.numFmts( i ).numFmtId;
+        l_numFmtId := workbook.numFmts( i ).numFmtId;
         exit;
       end if;
     end loop;
-    if t_numFmtId is null
+    if l_numFmtId is null
     then
-      t_numFmtId := case when t_cnt = 0 then 164 else workbook.numFmts( t_cnt ).numFmtId + 1 end;
-      t_cnt := t_cnt + 1;
-      workbook.numFmts( t_cnt ).numFmtId := t_numFmtId;
-      workbook.numFmts( t_cnt ).formatCode := p_format;
-      workbook.numFmtIndexes( t_numFmtId ) := t_cnt;
+      l_numFmtId := case when l_cnt = 0 then 164 else workbook.numFmts( l_cnt ).numFmtId + 1 end;
+      l_cnt := l_cnt + 1;
+      workbook.numFmts( l_cnt ).numFmtId := l_numFmtId;
+      workbook.numFmts( l_cnt ).formatCode := p_format;
+      workbook.numFmtIndexes( l_numFmtId ) := l_cnt;
     end if;
-    return t_numFmtId;
+    return l_numFmtId;
   end;
---
+
+  -- Registers a font and returns its 0-based index.
+  -- De-duplicates: returns existing index if all attributes match.
   function get_font
     ( p_name varchar2
     , p_family pls_integer := 2
@@ -552,7 +621,7 @@ is
     )
   return pls_integer
   is
-    t_ind pls_integer;
+    l_ind pls_integer;
   begin
     if workbook.fonts.count > 0
     then
@@ -574,25 +643,26 @@ is
         end if;
       end loop;
     end if;
-    t_ind := workbook.fonts.count;
-    workbook.fonts( t_ind ).name := p_name;
-    workbook.fonts( t_ind ).family := p_family;
-    workbook.fonts( t_ind ).fontsize := p_fontsize;
-    workbook.fonts( t_ind ).theme := p_theme;
-    workbook.fonts( t_ind ).underline := p_underline;
-    workbook.fonts( t_ind ).italic := p_italic;
-    workbook.fonts( t_ind ).bold := p_bold;
-    workbook.fonts( t_ind ).rgb := p_rgb;
-    return t_ind;
+    l_ind := workbook.fonts.count;
+    workbook.fonts( l_ind ).name := p_name;
+    workbook.fonts( l_ind ).family := p_family;
+    workbook.fonts( l_ind ).fontsize := p_fontsize;
+    workbook.fonts( l_ind ).theme := p_theme;
+    workbook.fonts( l_ind ).underline := p_underline;
+    workbook.fonts( l_ind ).italic := p_italic;
+    workbook.fonts( l_ind ).bold := p_bold;
+    workbook.fonts( l_ind ).rgb := p_rgb;
+    return l_ind;
   end;
---
+
+  -- Registers a fill pattern and returns its 0-based index.
   function get_fill
     ( p_patternType varchar2
     , p_fgRGB varchar2 := null
     )
   return pls_integer
   is
-    t_ind pls_integer;
+    l_ind pls_integer;
   begin
     if workbook.fills.count > 0
     then
@@ -606,12 +676,13 @@ is
         end if;
       end loop;
     end if;
-    t_ind := workbook.fills.count;
-    workbook.fills( t_ind ).patternType := p_patternType;
-    workbook.fills( t_ind ).fgRGB := upper( p_fgRGB );
-    return t_ind;
+    l_ind := workbook.fills.count;
+    workbook.fills( l_ind ).patternType := p_patternType;
+    workbook.fills( l_ind ).fgRGB := upper( p_fgRGB );
+    return l_ind;
   end;
---
+
+  -- Registers a border style and returns its 0-based index.
   function get_border
     ( p_top    varchar2 := 'thin'
     , p_bottom varchar2 := 'thin'
@@ -621,7 +692,7 @@ is
     )
   return pls_integer
   is
-    t_ind pls_integer;
+    l_ind pls_integer;
   begin
     if workbook.borders.count > 0
     then
@@ -638,15 +709,17 @@ is
         end if;
       end loop;
     end if;
-    t_ind := workbook.borders.count;
-    workbook.borders( t_ind ).top    := p_top;
-    workbook.borders( t_ind ).bottom := p_bottom;
-    workbook.borders( t_ind ).left   := p_left;
-    workbook.borders( t_ind ).right  := p_right;
-    workbook.borders( t_ind ).rgb    := p_rgb;
-    return t_ind;
+    l_ind := workbook.borders.count;
+    workbook.borders( l_ind ).top    := p_top;
+    workbook.borders( l_ind ).bottom := p_bottom;
+    workbook.borders( l_ind ).left   := p_left;
+    workbook.borders( l_ind ).right  := p_right;
+    workbook.borders( l_ind ).rgb    := p_rgb;
+    return l_ind;
   end;
---
+
+  -- Builds a tp_alignment record from the given parameters.
+  -- Rotation is clamped to 1..180 (NULL if out of range).
   function get_alignment
     ( p_vertical   varchar2 := null
     , p_horizontal varchar2 := null
@@ -656,20 +729,22 @@ is
   return tp_alignment
   is
     l_rotation number;
-    t_rv tp_alignment;
+    l_rv tp_alignment;
   begin
     l_rotation := round( p_rotation );
     if l_rotation <= 0 or l_rotation > 180
     then
       l_rotation := null;
     end if;
-    t_rv.vertical   := p_vertical;
-    t_rv.horizontal := p_horizontal;
-    t_rv.wrapText   := p_wrapText;
-    t_rv.rotation   := l_rotation;
-    return t_rv;
+    l_rv.vertical   := p_vertical;
+    l_rv.horizontal := p_horizontal;
+    l_rv.wrapText   := p_wrapText;
+    l_rv.rotation   := l_rotation;
+    return l_rv;
   end;
-  --
+
+  -- Registers a combined cell style (XF record) and returns its 1-based index.
+  -- Returns NULL when all components are default (no styling needed).
   function get_xfid
     ( p_numFmtId  pls_integer  := null
     , p_fontId    pls_integer  := null
@@ -716,7 +791,10 @@ is
     workbook.cellXfs( l_cnt ) := l_XF;
     return l_cnt;
   end get_XfId;
-  --
+
+  -- Resolves the effective cell style by cascading column and row defaults,
+  -- then registers the combined XF.  Returns the s="N" attribute string for
+  -- the <c> element, or empty string if no style applies.
   function get_XfId
     ( p_sheet     pls_integer
     , p_col       pls_integer
@@ -730,9 +808,9 @@ is
   return varchar2
   is
     l_XfId   pls_integer;
-    t_XF     tp_XF_fmt;
-    t_col_XF tp_XF_fmt;
-    t_row_XF tp_XF_fmt;
+    l_XF     tp_XF_fmt;
+    l_col_XF tp_XF_fmt;
+    l_row_XF tp_XF_fmt;
   begin
     if not g_useXf
     then
@@ -740,34 +818,43 @@ is
     end if;
     if workbook.sheets( p_sheet ).col_fmts.exists( p_col )
     then
-      t_col_XF := workbook.sheets( p_sheet ).col_fmts( p_col );
+      l_col_XF := workbook.sheets( p_sheet ).col_fmts( p_col );
     end if;
     if workbook.sheets( p_sheet ).row_fmts.exists( p_row )
     then
-      t_row_XF := workbook.sheets( p_sheet ).row_fmts( p_row );
+      l_row_XF := workbook.sheets( p_sheet ).row_fmts( p_row );
     end if;
-    t_XF.numFmtId  := coalesce( p_numFmtId, t_col_XF.numFmtId, t_row_XF.numFmtId, 0 );
-    t_XF.fontId    := coalesce( p_fontId  , t_col_XF.fontId  , t_row_XF.fontId  , 0 );
-    t_XF.fillId    := coalesce( p_fillId  , t_col_XF.fillId  , t_row_XF.fillId  , 0 );
-    t_XF.borderId  := coalesce( p_borderId, t_col_XF.borderId, t_row_XF.borderId, 0 );
-    t_XF.alignment := get_alignment
-                        ( coalesce( p_alignment.vertical, t_col_XF.alignment.vertical, t_row_XF.alignment.vertical )
-                        , coalesce( p_alignment.horizontal, t_col_XF.alignment.horizontal, t_row_XF.alignment.horizontal )
-                        , coalesce( p_alignment.wrapText, t_col_XF.alignment.wrapText, t_row_XF.alignment.wrapText )
-                        , coalesce( p_alignment.rotation, t_col_XF.alignment.rotation, t_row_XF.alignment.rotation )
+    l_XF.numFmtId  := coalesce( p_numFmtId, l_col_XF.numFmtId, l_row_XF.numFmtId, 0 );
+    l_XF.fontId    := coalesce( p_fontId  , l_col_XF.fontId  , l_row_XF.fontId  , 0 );
+    l_XF.fillId    := coalesce( p_fillId  , l_col_XF.fillId  , l_row_XF.fillId  , 0 );
+    l_XF.borderId  := coalesce( p_borderId, l_col_XF.borderId, l_row_XF.borderId, 0 );
+    l_XF.alignment := get_alignment
+                        ( coalesce( p_alignment.vertical, l_col_XF.alignment.vertical, l_row_XF.alignment.vertical )
+                        , coalesce( p_alignment.horizontal, l_col_XF.alignment.horizontal, l_row_XF.alignment.horizontal )
+                        , coalesce( p_alignment.wrapText, l_col_XF.alignment.wrapText, l_row_XF.alignment.wrapText )
+                        , coalesce( p_alignment.rotation, l_col_XF.alignment.rotation, l_row_XF.alignment.rotation )
                         );
-    l_xfid := get_xfid( t_XF.numFmtId, t_XF.fontId, t_XF.fillId, t_XF.borderId, t_XF.alignment );
+    l_xfid := get_xfid( l_XF.numFmtId, l_XF.fontId, l_XF.fillId, l_XF.borderId, l_XF.alignment );
     if l_xfid is null
     then
       return '';
     end if;
-    if t_XF.numFmtId > 0
+    if l_XF.numFmtId > 0
     then
-      set_col_width( p_sheet, p_col, workbook.numFmts( workbook.numFmtIndexes( t_XF.numFmtId ) ).formatCode );
+      set_col_width( p_sheet, p_col, workbook.numFmts( workbook.numFmtIndexes( l_XF.numFmtId ) ).formatCode );
     end if;
     return 's="' || l_xfid || '"';
   end get_XfId;
+
+  --------------------------------------------------------------------------
+  -- Cell data procedures
   --
+  -- Three overloads for NUMBER, VARCHAR2, and DATE values.
+  -- Each stores the value in the sheet's row/column matrix and resolves
+  -- the cell style via get_XfId (unless an explicit p_xfId is supplied).
+  --------------------------------------------------------------------------
+
+  -- Writes a numeric value to a cell.
   procedure cell
     ( p_col   pls_integer
     , p_row   pls_integer
@@ -781,33 +868,37 @@ is
     , p_xfId      pls_integer  := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).value := p_value;
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).style :=
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).value := p_value;
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).style :=
       case when p_xfid is null
-        then get_XfId( t_sheet, p_col, p_row, p_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment )
+        then get_XfId( l_sheet, p_col, p_row, p_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment )
         else 's="' || p_xfid || '"'
       end;
   end;
---
+
+  -- Registers a string in the shared strings table and returns its index.
+  -- Increments the total string usage counter (str_cnt) on every call.
   function add_string( p_string varchar2 )
   return pls_integer
   is
-    t_cnt pls_integer;
+    l_cnt pls_integer;
   begin
     if workbook.strings.exists( nvl( p_string, '' ) )
     then
-      t_cnt := workbook.strings( nvl( p_string, '' ) );
+      l_cnt := workbook.strings( nvl( p_string, '' ) );
     else
-      t_cnt := workbook.strings.count;
-      workbook.str_ind( t_cnt ) := p_string;
-      workbook.strings( nvl( p_string, '' ) ) := t_cnt;
+      l_cnt := workbook.strings.count;
+      workbook.str_ind( l_cnt ) := p_string;
+      workbook.strings( nvl( p_string, '' ) ) := l_cnt;
     end if;
     workbook.str_cnt := workbook.str_cnt + 1;
-    return t_cnt;
+    return l_cnt;
   end;
---
+
+  -- Writes a string value to a cell.
+  -- Auto-enables wrapText when the string contains CR characters.
   procedure cell
     ( p_col   pls_integer
     , p_row   pls_integer
@@ -821,21 +912,25 @@ is
     , p_xfId      pls_integer  := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
-    t_alignment tp_alignment := p_alignment;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_alignment tp_alignment := p_alignment;
   begin
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).value := add_string( p_value );
-    if t_alignment.wrapText is null and instr( p_value, chr(13) ) > 0
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).value := add_string( p_value );
+    if l_alignment.wrapText is null and instr( p_value, chr(13) ) > 0
     then
-      t_alignment.wrapText := true;
+      l_alignment.wrapText := true;
     end if;
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).style := 't="s" ' ||
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).style := 't="s" ' ||
       case when p_xfid is null
-        then get_XfId( t_sheet, p_col, p_row, p_numFmtId, p_fontId, p_fillId, p_borderId, t_alignment )
+        then get_XfId( l_sheet, p_col, p_row, p_numFmtId, p_fontId, p_fillId, p_borderId, l_alignment )
         else 's="' || p_xfid || '"'
       end;
   end;
---
+
+  -- Writes a date value to a cell.
+  -- Converts the date to an Excel serial number (days since 1900-01-01).
+  -- Defaults to 'dd/mm/yyyy' format when no numFmtId or column/row format
+  -- is specified.
   procedure cell
     ( p_col   pls_integer
     , p_row   pls_integer
@@ -849,33 +944,38 @@ is
     , p_xfId      pls_integer  := null
     )
   is
-    t_xfId     varchar2(100);
-    t_numFmtId pls_integer := p_numFmtId;
-    t_sheet    pls_integer := nvl( p_sheet, workbook.sheets.count );
-    t_tmp      number;
+    l_xfId     varchar2(100);
+    l_numFmtId pls_integer := p_numFmtId;
+    l_sheet    pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_tmp      number;
   begin
-    t_tmp := p_value - date '1900-03-01';
-    t_tmp := t_tmp + case when t_tmp < 0 then 60 else 61 end;
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).value := t_tmp;
+    l_tmp := p_value - date '1900-03-01';
+    l_tmp := l_tmp + case when l_tmp < 0 then 60 else 61 end;
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).value := l_tmp;
     if p_xfId is null
     then
-      if t_numFmtId is null
-         and not (   workbook.sheets( t_sheet ).col_fmts.exists( p_col )
-                 and workbook.sheets( t_sheet ).col_fmts( p_col ).numFmtId is not null
+      if l_numFmtId is null
+         and not (   workbook.sheets( l_sheet ).col_fmts.exists( p_col )
+                 and workbook.sheets( l_sheet ).col_fmts( p_col ).numFmtId is not null
                  )
-         and not (   workbook.sheets( t_sheet ).row_fmts.exists( p_row )
-                 and workbook.sheets( t_sheet ).row_fmts( p_row ).numFmtId is not null
+         and not (   workbook.sheets( l_sheet ).row_fmts.exists( p_row )
+                 and workbook.sheets( l_sheet ).row_fmts( p_row ).numFmtId is not null
                  )
       then
-        t_numFmtId := get_numFmt( 'dd/mm/yyyy' );
+        l_numFmtId := get_numFmt( 'dd/mm/yyyy' );
       end if;
-      t_xfId := get_XfId( t_sheet, p_col, p_row, t_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment );
+      l_xfId := get_XfId( l_sheet, p_col, p_row, l_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment );
     else
-      t_xfId := 's="' || p_xfid || '"';
+      l_xfId := 's="' || p_xfid || '"';
     end if;
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).style := t_xfId;
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).style := l_xfId;
   end;
-  --
+
+  --------------------------------------------------------------------------
+  -- Formula procedures
+  --------------------------------------------------------------------------
+
+  -- Writes a formula that evaluates to a number.
   procedure num_formula
     ( p_col           pls_integer
     , p_row           pls_integer
@@ -895,7 +995,8 @@ is
     cell( p_col, p_row, p_default_value, p_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment, l_sheet, p_xfId );
     workbook.sheets( l_sheet ).rows( p_row )( p_col ).formula := '<f>' || p_formula || '</f>';
   end num_formula;
-  --
+
+  -- Writes a formula that evaluates to a string.
   procedure str_formula
     ( p_col           pls_integer
     , p_row           pls_integer
@@ -915,7 +1016,8 @@ is
     cell( p_col, p_row, p_default_value, p_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment, l_sheet, p_xfId );
     workbook.sheets( l_sheet ).rows( p_row )( p_col ).formula := '<f>' || p_formula || '</f>';
   end str_formula;
-  --
+
+  -- Writes a formula that evaluates to a date.
   procedure date_formula
     ( p_col           pls_integer
     , p_row           pls_integer
@@ -935,7 +1037,9 @@ is
     cell( p_col, p_row, p_default_value, p_numFmtId, p_fontId, p_fillId, p_borderId, p_alignment, l_sheet, p_xfId );
     workbook.sheets( l_sheet ).rows( p_row )( p_col ).formula := '<f>' || p_formula || '</f>';
   end date_formula;
-  --
+
+  -- Internal: writes a date cell with a pre-resolved XfId string.
+  -- Used by query2sheet when g_useXf is false.
   procedure query_date_cell
     ( p_col pls_integer
     , p_row pls_integer
@@ -944,12 +1048,18 @@ is
     , p_XfId varchar2
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    cell( p_col, p_row, p_value, 0, p_sheet => t_sheet );
-    workbook.sheets( t_sheet ).rows( p_row )( p_col ).style := p_XfId;
+    cell( p_col, p_row, p_value, 0, p_sheet => l_sheet );
+    workbook.sheets( l_sheet ).rows( p_row )( p_col ).style := p_XfId;
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Cell features (hyperlinks, comments, merged cells, validations)
+  --------------------------------------------------------------------------
+
+  -- Adds a clickable hyperlink to a cell.
+  -- Either p_url (external) or p_location (internal bookmark) must be set.
   procedure hyperlink
     ( p_col pls_integer
     , p_row pls_integer
@@ -960,21 +1070,22 @@ is
     , p_tooltip varchar2 := null
     )
   is
-    t_ind pls_integer;
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_ind pls_integer;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
     if p_url is not null or p_location is not null
     then
-      workbook.sheets( t_sheet ).rows( p_row )( p_col ).value := add_string( coalesce( p_value, p_url, p_location ) );
-      workbook.sheets( t_sheet ).rows( p_row )( p_col ).style := 't="s" ' || get_XfId( t_sheet, p_col, p_row, '', get_font( 'Calibri', p_theme => 10, p_underline => true ) );
-      t_ind := workbook.sheets( t_sheet ).hyperlinks.count + 1;
-      workbook.sheets( t_sheet ).hyperlinks( t_ind ).cell := alfan_col( p_col ) || p_row;
-      workbook.sheets( t_sheet ).hyperlinks( t_ind ).url := p_url;
-      workbook.sheets( t_sheet ).hyperlinks( t_ind ).location := p_location;
-      workbook.sheets( t_sheet ).hyperlinks( t_ind ).tooltip := p_tooltip;
+      workbook.sheets( l_sheet ).rows( p_row )( p_col ).value := add_string( coalesce( p_value, p_url, p_location ) );
+      workbook.sheets( l_sheet ).rows( p_row )( p_col ).style := 't="s" ' || get_XfId( l_sheet, p_col, p_row, '', get_font( 'Calibri', p_theme => 10, p_underline => true ) );
+      l_ind := workbook.sheets( l_sheet ).hyperlinks.count + 1;
+      workbook.sheets( l_sheet ).hyperlinks( l_ind ).cell := alfan_col( p_col ) || p_row;
+      workbook.sheets( l_sheet ).hyperlinks( l_ind ).url := p_url;
+      workbook.sheets( l_sheet ).hyperlinks( l_ind ).location := p_location;
+      workbook.sheets( l_sheet ).hyperlinks( l_ind ).tooltip := p_tooltip;
     end if;
   end;
---
+
+  -- Adds a comment (note) to a cell.
   procedure comment
     ( p_col pls_integer
     , p_row pls_integer
@@ -985,18 +1096,19 @@ is
     , p_sheet pls_integer := null
     )
   is
-    t_ind pls_integer;
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_ind pls_integer;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    t_ind := workbook.sheets( t_sheet ).comments.count + 1;
-    workbook.sheets( t_sheet ).comments( t_ind ).row := p_row;
-    workbook.sheets( t_sheet ).comments( t_ind ).column := p_col;
-    workbook.sheets( t_sheet ).comments( t_ind ).text := dbms_xmlgen.convert( p_text );
-    workbook.sheets( t_sheet ).comments( t_ind ).author := dbms_xmlgen.convert( p_author );
-    workbook.sheets( t_sheet ).comments( t_ind ).width := p_width;
-    workbook.sheets( t_sheet ).comments( t_ind ).height := p_height;
+    l_ind := workbook.sheets( l_sheet ).comments.count + 1;
+    workbook.sheets( l_sheet ).comments( l_ind ).row := p_row;
+    workbook.sheets( l_sheet ).comments( l_ind ).column := p_col;
+    workbook.sheets( l_sheet ).comments( l_ind ).text := dbms_xmlgen.convert( p_text );
+    workbook.sheets( l_sheet ).comments( l_ind ).author := dbms_xmlgen.convert( p_author );
+    workbook.sheets( l_sheet ).comments( l_ind ).width := p_width;
+    workbook.sheets( l_sheet ).comments( l_ind ).height := p_height;
   end;
---
+
+  -- Merges a rectangular range of cells.
   procedure mergecells
     ( p_tl_col pls_integer -- top left
     , p_tl_row pls_integer
@@ -1005,13 +1117,14 @@ is
     , p_sheet pls_integer := null
     )
   is
-    t_ind pls_integer;
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_ind pls_integer;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    t_ind := workbook.sheets( t_sheet ).mergecells.count + 1;
-    workbook.sheets( t_sheet ).mergecells( t_ind ) := alfan_col( p_tl_col ) || p_tl_row || ':' || alfan_col( p_br_col ) || p_br_row;
+    l_ind := workbook.sheets( l_sheet ).mergecells.count + 1;
+    workbook.sheets( l_sheet ).mergecells( l_ind ) := alfan_col( p_tl_col ) || p_tl_row || ':' || alfan_col( p_br_col ) || p_br_row;
   end;
---
+
+  -- Internal: adds a data validation rule to a sheet.
   procedure add_validation
     ( p_type varchar2
     , p_sqref varchar2
@@ -1026,21 +1139,22 @@ is
     , p_sheet pls_integer := null
     )
   is
-    t_ind pls_integer;
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_ind pls_integer;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    t_ind := workbook.sheets( t_sheet ).validations.count + 1;
-    workbook.sheets( t_sheet ).validations( t_ind ).type := p_type;
-    workbook.sheets( t_sheet ).validations( t_ind ).errorstyle := p_style;
-    workbook.sheets( t_sheet ).validations( t_ind ).sqref := p_sqref;
-    workbook.sheets( t_sheet ).validations( t_ind ).formula1 := p_formula1;
-    workbook.sheets( t_sheet ).validations( t_ind ).error_title := p_error_title;
-    workbook.sheets( t_sheet ).validations( t_ind ).error_txt := p_error_txt;
-    workbook.sheets( t_sheet ).validations( t_ind ).title := p_title;
-    workbook.sheets( t_sheet ).validations( t_ind ).prompt := p_prompt;
-    workbook.sheets( t_sheet ).validations( t_ind ).showerrormessage := p_show_error;
+    l_ind := workbook.sheets( l_sheet ).validations.count + 1;
+    workbook.sheets( l_sheet ).validations( l_ind ).type := p_type;
+    workbook.sheets( l_sheet ).validations( l_ind ).errorstyle := p_style;
+    workbook.sheets( l_sheet ).validations( l_ind ).sqref := p_sqref;
+    workbook.sheets( l_sheet ).validations( l_ind ).formula1 := p_formula1;
+    workbook.sheets( l_sheet ).validations( l_ind ).error_title := p_error_title;
+    workbook.sheets( l_sheet ).validations( l_ind ).error_txt := p_error_txt;
+    workbook.sheets( l_sheet ).validations( l_ind ).title := p_title;
+    workbook.sheets( l_sheet ).validations( l_ind ).prompt := p_prompt;
+    workbook.sheets( l_sheet ).validations( l_ind ).showerrormessage := p_show_error;
   end;
---
+
+  -- Adds a dropdown list validation referencing a cell range.
   procedure list_validation
     ( p_sqref_col pls_integer
     , p_sqref_row pls_integer
@@ -1070,7 +1184,8 @@ is
                   , p_sheet => p_sheet
                   );
   end;
---
+
+  -- Adds a dropdown list validation referencing a defined name.
   procedure list_validation
     ( p_sqref_col pls_integer
     , p_sqref_row pls_integer
@@ -1097,7 +1212,8 @@ is
                   , p_sheet => p_sheet
                   );
   end;
---
+
+  -- Creates a named range pointing to a cell range on a sheet.
   procedure defined_name
     ( p_tl_col pls_integer -- top left
     , p_tl_row pls_integer
@@ -1108,27 +1224,33 @@ is
     , p_localsheet pls_integer := null
     )
   is
-    t_ind pls_integer;
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_ind pls_integer;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    t_ind := workbook.defined_names.count + 1;
-    workbook.defined_names( t_ind ).name := p_name;
-    workbook.defined_names( t_ind ).ref := 'Sheet' || t_sheet || '!$' || alfan_col( p_tl_col ) || '$' ||  p_tl_row || ':$' || alfan_col( p_br_col ) || '$' || p_br_row;
-    workbook.defined_names( t_ind ).sheet := p_localsheet;
+    l_ind := workbook.defined_names.count + 1;
+    workbook.defined_names( l_ind ).name := p_name;
+    workbook.defined_names( l_ind ).ref := 'Sheet' || l_sheet || '!$' || alfan_col( p_tl_col ) || '$' ||  p_tl_row || ':$' || alfan_col( p_br_col ) || '$' || p_br_row;
+    workbook.defined_names( l_ind ).sheet := p_localsheet;
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Column & row formatting
+  --------------------------------------------------------------------------
+
+  -- Sets an explicit column width (in character units).
   procedure set_column_width
     ( p_col pls_integer
     , p_width number
     , p_sheet pls_integer := null
     )
   is
-    t_width number;
+    l_width number;
   begin
-    t_width := trunc( round( p_width * 7 ) * 256 / 7 ) / 256;
-    workbook.sheets( nvl( p_sheet, workbook.sheets.count ) ).widths( p_col ) := t_width;
+    l_width := trunc( round( p_width * 7 ) * 256 / 7 ) / 256;
+    workbook.sheets( nvl( p_sheet, workbook.sheets.count ) ).widths( p_col ) := l_width;
   end;
---
+
+  -- Sets default formatting for an entire column.
   procedure set_column
     ( p_col pls_integer
     , p_numFmtId pls_integer := null
@@ -1139,15 +1261,16 @@ is
     , p_sheet pls_integer := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    workbook.sheets( t_sheet ).col_fmts( p_col ).numFmtId := p_numFmtId;
-    workbook.sheets( t_sheet ).col_fmts( p_col ).fontId := p_fontId;
-    workbook.sheets( t_sheet ).col_fmts( p_col ).fillId := p_fillId;
-    workbook.sheets( t_sheet ).col_fmts( p_col ).borderId := p_borderId;
-    workbook.sheets( t_sheet ).col_fmts( p_col ).alignment := p_alignment;
+    workbook.sheets( l_sheet ).col_fmts( p_col ).numFmtId := p_numFmtId;
+    workbook.sheets( l_sheet ).col_fmts( p_col ).fontId := p_fontId;
+    workbook.sheets( l_sheet ).col_fmts( p_col ).fillId := p_fillId;
+    workbook.sheets( l_sheet ).col_fmts( p_col ).borderId := p_borderId;
+    workbook.sheets( l_sheet ).col_fmts( p_col ).alignment := p_alignment;
   end;
---
+
+  -- Sets default formatting and/or height for an entire row.
   procedure set_row
     ( p_row pls_integer
     , p_numFmtId pls_integer := null
@@ -1159,55 +1282,67 @@ is
     , p_height number := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
-    t_cells tp_cells;
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_cells tp_cells;
   begin
-    workbook.sheets( t_sheet ).row_fmts( p_row ).numFmtId := p_numFmtId;
-    workbook.sheets( t_sheet ).row_fmts( p_row ).fontId := p_fontId;
-    workbook.sheets( t_sheet ).row_fmts( p_row ).fillId := p_fillId;
-    workbook.sheets( t_sheet ).row_fmts( p_row ).borderId := p_borderId;
-    workbook.sheets( t_sheet ).row_fmts( p_row ).alignment := p_alignment;
-    workbook.sheets( t_sheet ).row_fmts( p_row ).height := trunc( p_height * 4 / 3 ) * 3 / 4;
-    if not workbook.sheets( t_sheet ).rows.exists( p_row )
+    workbook.sheets( l_sheet ).row_fmts( p_row ).numFmtId := p_numFmtId;
+    workbook.sheets( l_sheet ).row_fmts( p_row ).fontId := p_fontId;
+    workbook.sheets( l_sheet ).row_fmts( p_row ).fillId := p_fillId;
+    workbook.sheets( l_sheet ).row_fmts( p_row ).borderId := p_borderId;
+    workbook.sheets( l_sheet ).row_fmts( p_row ).alignment := p_alignment;
+    workbook.sheets( l_sheet ).row_fmts( p_row ).height := trunc( p_height * 4 / 3 ) * 3 / 4;
+    if not workbook.sheets( l_sheet ).rows.exists( p_row )
     then
-      workbook.sheets( t_sheet ).rows( p_row ) := t_cells;
+      workbook.sheets( l_sheet ).rows( p_row ) := l_cells;
     end if;
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Freeze panes
+  --------------------------------------------------------------------------
+
+  -- Freezes the top N rows.
   procedure freeze_rows
     ( p_nr_rows pls_integer := 1
     , p_sheet pls_integer := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    workbook.sheets( t_sheet ).freeze_cols := null;
-    workbook.sheets( t_sheet ).freeze_rows := p_nr_rows;
+    workbook.sheets( l_sheet ).freeze_cols := null;
+    workbook.sheets( l_sheet ).freeze_rows := p_nr_rows;
   end;
---
+
+  -- Freezes the left N columns.
   procedure freeze_cols
     ( p_nr_cols pls_integer := 1
     , p_sheet pls_integer := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    workbook.sheets( t_sheet ).freeze_rows := null;
-    workbook.sheets( t_sheet ).freeze_cols := p_nr_cols;
+    workbook.sheets( l_sheet ).freeze_rows := null;
+    workbook.sheets( l_sheet ).freeze_cols := p_nr_cols;
   end;
---
+
+  -- Freezes both rows and columns at the given position.
   procedure freeze_pane
     ( p_col pls_integer
     , p_row pls_integer
     , p_sheet pls_integer := null
     )
   is
-    t_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
+    l_sheet pls_integer := nvl( p_sheet, workbook.sheets.count );
   begin
-    workbook.sheets( t_sheet ).freeze_rows := p_row;
-    workbook.sheets( t_sheet ).freeze_cols := p_col;
+    workbook.sheets( l_sheet ).freeze_rows := p_row;
+    workbook.sheets( l_sheet ).freeze_cols := p_col;
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Autofilter & tables
+  --------------------------------------------------------------------------
+
+  -- Enables autofilter dropdown buttons on a range.
   procedure set_autofilter
     ( p_column_start pls_integer := null
     , p_column_end pls_integer := null
@@ -1216,25 +1351,26 @@ is
     , p_sheet pls_integer := null
     )
   is
-    t_ind pls_integer;
-    t_sheet pls_integer := coalesce( p_sheet, workbook.sheets.count );
+    l_ind pls_integer;
+    l_sheet pls_integer := coalesce( p_sheet, workbook.sheets.count );
   begin
-    t_ind := 1;
-    workbook.sheets( t_sheet ).autofilters( t_ind ).column_start := p_column_start;
-    workbook.sheets( t_sheet ).autofilters( t_ind ).column_end := p_column_end;
-    workbook.sheets( t_sheet ).autofilters( t_ind ).row_start := p_row_start;
-    workbook.sheets( t_sheet ).autofilters( t_ind ).row_end := p_row_end;
+    l_ind := 1;
+    workbook.sheets( l_sheet ).autofilters( l_ind ).column_start := p_column_start;
+    workbook.sheets( l_sheet ).autofilters( l_ind ).column_end := p_column_end;
+    workbook.sheets( l_sheet ).autofilters( l_ind ).row_start := p_row_start;
+    workbook.sheets( l_sheet ).autofilters( l_ind ).row_end := p_row_end;
     defined_name
       ( p_column_start
       , p_row_start
       , p_column_end
       , p_row_end
       , '_xlnm._FilterDatabase'
-      , t_sheet
-      , t_sheet - 1
+      , l_sheet
+      , l_sheet - 1
       );
   end;
---
+
+  -- Defines a formatted table on a range with a named style.
   procedure set_table
     ( p_column_start pls_integer
     , p_column_end   pls_integer
@@ -1245,120 +1381,135 @@ is
     , p_sheet        pls_integer := null
     )
   is
-    t_table tp_table;
-    t_cnt pls_integer := workbook.tables.count + 1;
+    l_table tp_table;
+    l_cnt pls_integer := workbook.tables.count + 1;
   begin
-    t_table.sheet := coalesce( p_sheet, workbook.sheets.count );
-    t_table.column_start := p_column_start;
-    t_table.column_end   := p_column_end;
-    t_table.row_start    := p_row_start;
-    t_table.row_end      := p_row_end;
-    t_table.name         := coalesce( p_name, 'Table' || t_cnt );
-    t_table.style        := p_style;
-    workbook.tables( t_cnt ) := t_table;
+    l_table.sheet := coalesce( p_sheet, workbook.sheets.count );
+    l_table.column_start := p_column_start;
+    l_table.column_end   := p_column_end;
+    l_table.row_start    := p_row_start;
+    l_table.row_end      := p_row_end;
+    l_table.name         := coalesce( p_name, 'Table' || l_cnt );
+    l_table.style        := p_style;
+    workbook.tables( l_cnt ) := l_table;
   end;
---
+
+  --------------------------------------------------------------------------
+  -- XML helper procedures
+  --
+  -- add1xml converts a CLOB of XML to UTF-8 BLOB and adds it as a file
+  -- to the ZIP archive.
+  --------------------------------------------------------------------------
+
+  -- Converts an XML CLOB to UTF-8 and adds it as a ZIP entry.
   procedure add1xml
     ( p_excel in out nocopy blob
     , p_filename varchar2
     , p_xml clob
     )
   is
-    t_tmp blob;
-    dest_offset integer := 1;
-    src_offset integer := 1;
-    lang_context integer;
-    warning integer;
+    l_tmp blob;
+    l_dest_offset integer := 1;
+    l_src_offset integer := 1;
+    l_lang_context integer;
+    l_warning integer;
   begin
-    lang_context := dbms_lob.DEFAULT_LANG_CTX;
-    dbms_lob.createtemporary( t_tmp, true );
+    l_lang_context := dbms_lob.DEFAULT_LANG_CTX;
+    dbms_lob.createtemporary( l_tmp, true );
     dbms_lob.converttoblob
-      ( t_tmp
+      ( l_tmp
       , p_xml
       , dbms_lob.lobmaxsize
-      , dest_offset
-      , src_offset
+      , l_dest_offset
+      , l_src_offset
       ,  nls_charset_id( 'AL32UTF8'  )
-      , lang_context
-      , warning
+      , l_lang_context
+      , l_warning
       );
-    add1file( p_excel, p_filename, t_tmp );
-    dbms_lob.freetemporary( t_tmp );
+    add1file( p_excel, p_filename, l_tmp );
+    dbms_lob.freetemporary( l_tmp );
   end;
---
+
+  --------------------------------------------------------------------------
+  -- Drawing helper
+  --------------------------------------------------------------------------
+
+  -- Generates the DrawingML XML for a single two-cell-anchored image.
+  -- Calculates the end column/row and offsets based on image dimensions,
+  -- column widths, and row heights.
   function finish_drawing( p_drawing tp_drawing, p_idx pls_integer, p_sheet pls_integer )
   return varchar2
   is
-    t_rv varchar2(32767);
-    t_col pls_integer;
-    t_row pls_integer;
-    t_width number;
-    t_height number;
-    t_col_offs number;
-    t_row_offs number;
-    t_col_width number;
-    t_row_height number;
-    t_widths tp_widths;
-    t_heights tp_row_fmts;
+    l_rv varchar2(32767);
+    l_col pls_integer;
+    l_row pls_integer;
+    l_width number;
+    l_height number;
+    l_col_offs number;
+    l_row_offs number;
+    l_col_width number;
+    l_row_height number;
+    l_widths tp_widths;
+    l_heights tp_row_fmts;
   begin
-    t_width  := workbook.images( p_drawing.img_id ).width;
-    t_height := workbook.images( p_drawing.img_id ).height;
+    l_width  := workbook.images( p_drawing.img_id ).width;
+    l_height := workbook.images( p_drawing.img_id ).height;
     if p_drawing.scale is not null
     then
-      t_width  := p_drawing.scale * t_width;
-      t_height := p_drawing.scale * t_height;
+      l_width  := p_drawing.scale * l_width;
+      l_height := p_drawing.scale * l_height;
     end if;
     if workbook.sheets( p_sheet ).widths.count = 0
     then
 -- assume default column widths!
 -- 64 px = 1 col = 609600
-      t_col := trunc( t_width / 64 );
-      t_col_offs := ( t_width - t_col * 64 ) * 9525;
-      t_col := p_drawing.col - 1 + t_col;
+      l_col := trunc( l_width / 64 );
+      l_col_offs := ( l_width - l_col * 64 ) * 9525;
+      l_col := p_drawing.col - 1 + l_col;
     else
-      t_widths := workbook.sheets( p_sheet ).widths;
-      t_col := p_drawing.col;
+      l_widths := workbook.sheets( p_sheet ).widths;
+      l_col := p_drawing.col;
       loop
-        if t_widths.exists( t_col )
+        if l_widths.exists( l_col )
         then
-          t_col_width := round( 7 * t_widths( t_col ) );
+          l_col_width := round( 7 * l_widths( l_col ) );
         else
-          t_col_width := 64;
+          l_col_width := 64;
         end if;
-        exit when t_width < t_col_width;
-        t_col := t_col + 1;
-        t_width := t_width - t_col_width;
+        exit when l_width < l_col_width;
+        l_col := l_col + 1;
+        l_width := l_width - l_col_width;
       end loop;
-      t_col := t_col - 1;
-      t_col_offs := t_width * 9525;
+      l_col := l_col - 1;
+      l_col_offs := l_width * 9525;
     end if;
 --
     if workbook.sheets( p_sheet ).row_fmts.count = 0
     then
 -- assume default row heigths!
 -- 20 px = 1 row = 190500
-      t_row := trunc( t_height / 20 );
-      t_row_offs := ( t_height - t_row * 20 ) * 9525;
-      t_row := p_drawing.row - 1 + t_row;
+      l_row := trunc( l_height / 20 );
+      l_row_offs := ( l_height - l_row * 20 ) * 9525;
+      l_row := p_drawing.row - 1 + l_row;
     else
-      t_heights := workbook.sheets( p_sheet ).row_fmts;
-      t_row := p_drawing.row;
+      l_heights := workbook.sheets( p_sheet ).row_fmts;
+      l_row := p_drawing.row;
       loop
-        if t_heights.exists( t_row ) and t_heights( t_row ).height is not null
+        if l_heights.exists( l_row ) and l_heights( l_row ).height is not null
         then
-          t_row_height := t_heights( t_row ).height;
-          t_row_height := round( 4 * t_row_height / 3 );
+          l_row_height := l_heights( l_row ).height;
+          l_row_height := round( 4 * l_row_height / 3 );
         else
-          t_row_height := 20;
+          l_row_height := 20;
         end if;
-        exit when t_height < t_row_height;
-        t_row := t_row + 1;
-        t_height := t_height - t_row_height;
+        exit when l_height < l_row_height;
+        l_row := l_row + 1;
+        l_height := l_height - l_row_height;
       end loop;
-      t_row_offs := t_height * 9525;
-      t_row := t_row - 1;
+      l_row_offs := l_height * 9525;
+      l_row := l_row - 1;
     end if;
-    t_rv := '<xdr:twoCellAnchor editAs="oneCell">
+    l_rv := '<xdr:twoCellAnchor editAs="oneCell">
 <xdr:from>
 <xdr:col>' || ( p_drawing.col - 1 ) || '</xdr:col>
 <xdr:colOff>0</xdr:colOff>
@@ -1366,23 +1517,23 @@ is
 <xdr:rowOff>0</xdr:rowOff>
 </xdr:from>
 <xdr:to>
-<xdr:col>' || t_col || '</xdr:col>
-<xdr:colOff>' || t_col_offs || '</xdr:colOff>
-<xdr:row>' || t_row || '</xdr:row>
-<xdr:rowOff>' || t_row_offs || '</xdr:rowOff>
+<xdr:col>' || l_col || '</xdr:col>
+<xdr:colOff>' || l_col_offs || '</xdr:colOff>
+<xdr:row>' || l_row || '</xdr:row>
+<xdr:rowOff>' || l_row_offs || '</xdr:rowOff>
 </xdr:to>
 <xdr:pic>
 <xdr:nvPicPr>
 <xdr:cNvPr id="3" name="' || coalesce( p_drawing.name, 'Picture ' || p_idx ) || '"';
     if p_drawing.title is not null
     then
-      t_rv := t_rv || ' title="' || p_drawing.title || '"';
+      l_rv := l_rv || ' title="' || p_drawing.title || '"';
     end if;
     if p_drawing.description is not null
     then
-      t_rv := t_rv || ' descr="' || p_drawing.description || '"';
+      l_rv := l_rv || ' descr="' || p_drawing.description || '"';
     end if;
-    t_rv := t_rv || '/>
+    l_rv := l_rv || '/>
 <xdr:cNvPicPr>
 <a:picLocks noChangeAspect="1"/>
 </xdr:cNvPicPr>
@@ -1407,16 +1558,24 @@ is
 <xdr:clientData/>
 </xdr:twoCellAnchor>
 ';
-    return t_rv;
+    return l_rv;
   end;
-  --
+
+  -- Returns an XML element with an rgb attribute, or NULL when p_rgb is NULL.
   function add_rgb( p_rgb varchar2, p_tag varchar2 := 'color' )
   return varchar2
   is
   begin
     return case when p_rgb is not null then '<' || p_tag || ' rgb="' || p_rgb || '"/>' end;
   end;
+
+  --------------------------------------------------------------------------
+  -- Encryption (conditional compilation)
   --
+  -- Only compiled when as_xlsx.use_dbms_crypto = true in the spec.
+  -- Implements ECMA-376 Agile Encryption using AES-256-CBC and SHA-1,
+  -- wrapped in a Compound File Binary (CFB) container.
+  --------------------------------------------------------------------------
 $IF as_xlsx.use_dbms_crypto
 $THEN
   function excel_encrypt( p_xlsx blob, p_password varchar2 )
@@ -1857,7 +2016,16 @@ $THEN
     return t_cf;
   end excel_encrypt;
 $END
+
+  --------------------------------------------------------------------------
+  -- XLSX build procedures
   --
+  -- Each procedure generates one part of the XLSX (Office Open XML) package
+  -- and appends it to the ZIP archive BLOB.  They are called in sequence by
+  -- finish().
+  --------------------------------------------------------------------------
+
+  -- Generates [Content_Types].xml — the master content type map.
   procedure build_content_types( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -1911,7 +2079,8 @@ $END
 </Types>';
     add1xml( p_excel, '[Content_Types].xml', l_xxx );
   end build_content_types;
-  --
+
+  -- Generates xl/tables/table{n}.xml for each registered table.
   procedure build_tables( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -1958,7 +2127,8 @@ $END
       add1xml( p_excel, 'xl/tables/table' || to_char(i) || '.xml', l_xxx );
     end loop;
   end build_tables;
-  --
+
+  -- Generates docProps/core.xml (Dublin Core metadata: creator, timestamps).
   procedure build_core_properties( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -1973,7 +2143,8 @@ $END
 </cp:coreProperties>' );
     add1xml( p_excel, 'docProps/core.xml', l_xxx );
   end build_core_properties;
-  --
+
+  -- Generates docProps/app.xml (application metadata, sheet names).
   procedure build_app_properties( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -2012,7 +2183,8 @@ $END
 </Properties>';
     add1xml( p_excel, 'docProps/app.xml', l_xxx );
   end build_app_properties;
-  --
+
+  -- Generates _rels/.rels (top-level package relationships).
   procedure build_relationships( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -2025,7 +2197,8 @@ $END
 </Relationships>';
     add1xml( p_excel, '_rels/.rels', l_xxx );
   end build_relationships;
-  --
+
+  -- Generates xl/styles.xml (number formats, fonts, fills, borders, cell XFs).
   procedure build_styles( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -2114,7 +2287,8 @@ $END
 </styleSheet>' );
     add1xml( p_excel, 'xl/styles.xml', l_xxx );
   end build_styles;
-  --
+
+  -- Generates xl/workbook.xml (sheet list, defined names, calc properties).
   procedure build_workbook( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -2151,8 +2325,9 @@ $END
     l_xxx := l_xxx || '<calcPr calcId="144525"/></workbook>';
     add1xml( p_excel, 'xl/workbook.xml', l_xxx );
   end build_workbook;
-  --
-  -- Theme XML constant
+
+  -- Static Office Theme XML (colors, fonts, effects).
+  -- Declared as a package-body constant to avoid rebuilding on every call.
   c_THEME_XML constant clob := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
 <a:themeElements>
@@ -2436,13 +2611,20 @@ $END
 <a:objectDefaults/>
 <a:extraClrSchemeLst/>
 </a:theme>';
-  --
+
+  -- Generates xl/theme/theme1.xml from the static constant.
   procedure build_theme( p_excel in out nocopy blob )
   is
   begin
     add1xml( p_excel, 'xl/theme/theme1.xml', c_THEME_XML );
   end build_theme;
-  --
+
+  -- Generates all worksheet XML files:
+  --   xl/worksheets/sheet{n}.xml   — cell data, panes, autofilter, validations
+  --   xl/comments{n}.xml          — cell comments
+  --   xl/drawings/vmlDrawing{n}.vml — comment shapes (VML)
+  --   xl/drawings/drawing{n}.xml  — embedded images (DrawingML)
+  --   + associated .rels files
   procedure build_worksheets( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -2814,7 +2996,8 @@ style="position:absolute;margin-left:35.25pt;margin-top:3pt;z-index:' || to_char
       l_s := workbook.sheets.next( l_s );
     end loop;
   end build_worksheets;
-  --
+
+  -- Generates xl/_rels/workbook.xml.rels (shared strings, styles, theme, sheets).
   procedure build_workbook_rels( p_excel in out nocopy blob )
   is
     l_xxx clob;
@@ -2835,7 +3018,8 @@ style="position:absolute;margin-left:35.25pt;margin-top:3pt;z-index:' || to_char
     l_xxx := l_xxx || '</Relationships>';
     add1xml( p_excel, 'xl/_rels/workbook.xml.rels', l_xxx );
   end build_workbook_rels;
-  --
+
+  -- Adds all image BLOBs to the ZIP as xl/media/image{n}.png.
   procedure build_images( p_excel in out nocopy blob )
   is
   begin
@@ -2844,7 +3028,8 @@ style="position:absolute;margin-left:35.25pt;margin-top:3pt;z-index:' || to_char
       add1file( p_excel, 'xl/media/image' || i || '.png', workbook.images(i).img );
     end loop;
   end build_images;
-  --
+
+  -- Generates xl/sharedStrings.xml from the workbook string table.
   procedure build_shared_strings( p_excel in out nocopy blob )
   is
     l_yyy blob;
@@ -2862,7 +3047,14 @@ style="position:absolute;margin-left:35.25pt;margin-top:3pt;z-index:' || to_char
     addtxt2utf8blob_finish( l_yyy );
     add1file( p_excel, 'xl/sharedStrings.xml', l_yyy );
   end build_shared_strings;
+
+  --------------------------------------------------------------------------
+  -- finish — Main entry point for XLSX generation
   --
+  -- Orchestrates all build_* procedures in the correct order, finalises
+  -- the ZIP archive, clears workbook state, and optionally encrypts
+  -- the result with a password.
+  --------------------------------------------------------------------------
   function finish( p_password varchar2 := null )
   return blob
   is
@@ -2895,7 +3087,16 @@ $ELSE
     return l_excel;
 $END
   end finish;
---
+
+  --------------------------------------------------------------------------
+  -- Query to sheet
+  --
+  -- Populates a worksheet directly from a SQL query or SYS_REFCURSOR.
+  -- Handles NUMBER, DATE, and VARCHAR2 column types.  Supports optional
+  -- column headers, title row, autofilter, and table formatting.
+  --------------------------------------------------------------------------
+
+  -- Core implementation: fetches rows from an already-opened DBMS_SQL cursor.
   function query2sheet
     ( p_c              in out integer
     , p_column_headers boolean
@@ -2912,20 +3113,20 @@ $END
   return number
   is
     l_null varchar2(1);
-    t_sheet pls_integer;
-    t_col_cnt integer;
-    t_desc_tab dbms_sql.desc_tab2;
-    d_tab dbms_sql.date_table;
-    n_tab dbms_sql.number_table;
-    v_tab dbms_sql.varchar2_table;
-    t_bulk_size pls_integer := 200;
-    t_r integer;
-    t_col     pls_integer;
-    t_cur_row pls_integer;
-    t_useXf boolean := g_useXf;
+    l_sheet pls_integer;
+    l_col_cnt integer;
+    l_desc_tab dbms_sql.desc_tab2;
+    l_d_tab dbms_sql.date_table;
+    l_n_tab dbms_sql.number_table;
+    l_v_tab dbms_sql.varchar2_table;
+    l_bulk_size pls_integer := 200;
+    l_r integer;
+    l_col     pls_integer;
+    l_cur_row pls_integer;
+    l_useXf boolean := g_useXf;
     type tp_XfIds is table of varchar2(50) index by pls_integer;
-    t_XfIds tp_XfIds;
-    t_null_number number;
+    l_XfIds tp_XfIds;
+    l_null_number number;
     l_rows number;
     l_horizontal varchar2(3999);
     l_right       boolean;
@@ -2935,13 +3136,13 @@ $END
     then
       new_sheet;
     end if;
-    t_sheet := coalesce( p_sheet, workbook.sheets.count );
+    l_sheet := coalesce( p_sheet, workbook.sheets.count );
     setUseXf( true );
-    t_col := coalesce( p_col, 1 ) - 1;
-    t_cur_row := coalesce( p_row, 1 );
+    l_col := coalesce( p_col, 1 ) - 1;
+    l_cur_row := coalesce( p_row, 1 );
     if p_title is not null
     then
-      t_cur_row := t_cur_row + 1;
+      l_cur_row := l_cur_row + 1;
       if p_title_xfid is not null and workbook.cellXfs.exists( p_title_xfid )
       then
         l_horizontal := lower( workbook.cellXfs( p_title_xfid ).alignment.horizontal );
@@ -2951,39 +3152,39 @@ $END
       l_right := nvl( l_right, false );
       l_center_cont := nvl( l_center_cont, false );
     end if;
-    dbms_sql.describe_columns2( p_c, t_col_cnt, t_desc_tab );
-    for c in 1 .. t_col_cnt
+    dbms_sql.describe_columns2( p_c, l_col_cnt, l_desc_tab );
+    for c in 1 .. l_col_cnt
     loop
       if p_title is not null
       then
-        if ( c = 1 and not l_right ) or ( c = t_col_cnt and l_right )
+        if ( c = 1 and not l_right ) or ( c = l_col_cnt and l_right )
         then
-          cell( t_col + c, t_cur_row - 1, p_title, p_sheet => t_sheet );
+          cell( l_col + c, l_cur_row - 1, p_title, p_sheet => l_sheet );
           if p_title_xfid is not null
           then
-            workbook.sheets( t_sheet ).rows( t_cur_row - 1 )( t_col + c ).style := 't="s" s="' || p_title_xfid || '"';
+            workbook.sheets( l_sheet ).rows( l_cur_row - 1 )( l_col + c ).style := 't="s" s="' || p_title_xfid || '"';
           end if;
         elsif l_center_cont
         then
-          cell( t_col + c, t_cur_row - 1, t_null_number, p_sheet => t_sheet );
-          workbook.sheets( t_sheet ).rows( t_cur_row - 1 )( t_col + c ).style := 's="' || p_title_xfid || '"';
+          cell( l_col + c, l_cur_row - 1, l_null_number, p_sheet => l_sheet );
+          workbook.sheets( l_sheet ).rows( l_cur_row - 1 )( l_col + c ).style := 's="' || p_title_xfid || '"';
         end if;
       end if;
       if p_column_headers
       then
-        cell( t_col + c, t_cur_row, t_desc_tab( c ).col_name, p_sheet => t_sheet );
+        cell( l_col + c, l_cur_row, l_desc_tab( c ).col_name, p_sheet => l_sheet );
       end if;
       case
-        when t_desc_tab( c ).col_type in ( 2, 100, 101 )
+        when l_desc_tab( c ).col_type in ( 2, 100, 101 )
         then
-          dbms_sql.define_array( p_c, c, n_tab, t_bulk_size, 1 );
-        when t_desc_tab( c ).col_type in ( 12, 178, 179, 180, 181, 231 )
+          dbms_sql.define_array( p_c, c, l_n_tab, l_bulk_size, 1 );
+        when l_desc_tab( c ).col_type in ( 12, 178, 179, 180, 181, 231 )
         then
-          dbms_sql.define_array( p_c, c, d_tab, t_bulk_size, 1 );
-          t_XfIds(c) := get_XfId( t_sheet, t_col + c, t_cur_row, get_numFmt( coalesce( p_date_format, 'dd/mm/yyyy' ) ), null, null );
-        when t_desc_tab( c ).col_type in ( 1, 8, 9, 96, 112 )
+          dbms_sql.define_array( p_c, c, l_d_tab, l_bulk_size, 1 );
+          l_XfIds(c) := get_XfId( l_sheet, l_col + c, l_cur_row, get_numFmt( coalesce( p_date_format, 'dd/mm/yyyy' ) ), null, null );
+        when l_desc_tab( c ).col_type in ( 1, 8, 9, 96, 112 )
         then
-          dbms_sql.define_array( p_c, c, v_tab, t_bulk_size, 1 );
+          dbms_sql.define_array( p_c, c, l_v_tab, l_bulk_size, 1 );
         else
           null;
       end case;
@@ -2992,96 +3193,96 @@ $END
     setUseXf( p_UseXf );
     if p_column_headers
     then
-      t_cur_row := t_cur_row + 1;
+      l_cur_row := l_cur_row + 1;
     end if;
     --
     l_rows := 0;
     loop
-      t_r := dbms_sql.fetch_rows( p_c );
-      if t_r > 0
+      l_r := dbms_sql.fetch_rows( p_c );
+      if l_r > 0
       then
-        for c in 1 .. t_col_cnt
+        for c in 1 .. l_col_cnt
         loop
           case
-            when t_desc_tab( c ).col_type in ( 2, 100, 101 )
+            when l_desc_tab( c ).col_type in ( 2, 100, 101 )
             then
-              dbms_sql.column_value( p_c, c, n_tab );
-              for i in 0 .. t_r - 1
+              dbms_sql.column_value( p_c, c, l_n_tab );
+              for i in 0 .. l_r - 1
               loop
-                if n_tab( i + n_tab.first ) is not null
+                if l_n_tab( i + l_n_tab.first ) is not null
                 then
-                  cell( t_col + c, t_cur_row + i, n_tab( i + n_tab.first ), p_sheet => t_sheet );
+                  cell( l_col + c, l_cur_row + i, l_n_tab( i + l_n_tab.first ), p_sheet => l_sheet );
                 else
-                  cell( t_col + c, t_cur_row + i, t_null_number, p_sheet => t_sheet );
+                  cell( l_col + c, l_cur_row + i, l_null_number, p_sheet => l_sheet );
                 end if;
               end loop;
-              n_tab.delete;
-            when t_desc_tab( c ).col_type in ( 12, 178, 179, 180, 181, 231 )
+              l_n_tab.delete;
+            when l_desc_tab( c ).col_type in ( 12, 178, 179, 180, 181, 231 )
             then
-              dbms_sql.column_value( p_c, c, d_tab );
-              for i in 0 .. t_r - 1
+              dbms_sql.column_value( p_c, c, l_d_tab );
+              for i in 0 .. l_r - 1
               loop
-                if d_tab( i + d_tab.first ) is not null
+                if l_d_tab( i + l_d_tab.first ) is not null
                 then
                   if g_useXf
                   then
-                    cell( t_col + c, t_cur_row + i, d_tab( i + d_tab.first ), p_sheet => t_sheet );
+                    cell( l_col + c, l_cur_row + i, l_d_tab( i + l_d_tab.first ), p_sheet => l_sheet );
                   else
-                    query_date_cell( t_col + c, t_cur_row + i, d_tab( i + d_tab.first ), t_sheet, t_XfIds(c) );
+                    query_date_cell( l_col + c, l_cur_row + i, l_d_tab( i + l_d_tab.first ), l_sheet, l_XfIds(c) );
                   end if;
                 else
-                  cell( t_col + c, t_cur_row + i, t_null_number, p_sheet => t_sheet );
+                  cell( l_col + c, l_cur_row + i, l_null_number, p_sheet => l_sheet );
                 end if;
               end loop;
-              d_tab.delete;
-            when t_desc_tab( c ).col_type in ( 1, 8, 9, 96, 112 )
+              l_d_tab.delete;
+            when l_desc_tab( c ).col_type in ( 1, 8, 9, 96, 112 )
             then
-              dbms_sql.column_value( p_c, c, v_tab );
-              for i in 0 .. t_r - 1
+              dbms_sql.column_value( p_c, c, l_v_tab );
+              for i in 0 .. l_r - 1
               loop
-                if v_tab( i + v_tab.first ) is not null
+                if l_v_tab( i + l_v_tab.first ) is not null
                 then
-                  cell( t_col + c, t_cur_row + i, v_tab( i + v_tab.first ), p_sheet => t_sheet );
+                  cell( l_col + c, l_cur_row + i, l_v_tab( i + l_v_tab.first ), p_sheet => l_sheet );
                 else
-                  cell( t_col + c, t_cur_row + i, t_null_number, p_sheet => t_sheet );
+                  cell( l_col + c, l_cur_row + i, l_null_number, p_sheet => l_sheet );
                 end if;
               end loop;
-              v_tab.delete;
+              l_v_tab.delete;
             else
               null;
           end case;
         end loop;
       end if;
-      l_rows := l_rows + t_r;
-      t_cur_row := t_cur_row + t_r;
-      exit when t_r != t_bulk_size;
+      l_rows := l_rows + l_r;
+      l_cur_row := l_cur_row + l_r;
+      exit when l_r != l_bulk_size;
     end loop;
     dbms_sql.close_cursor( p_c );
     --
     if p_autofilter and p_table_style is null and p_column_headers
     then
       set_autofilter
-        ( p_column_start => t_col + 1
-        , p_column_end   => t_col + t_col_cnt
+        ( p_column_start => l_col + 1
+        , p_column_end   => l_col + l_col_cnt
         , p_row_start    => coalesce( p_row, 1 ) + case when p_title is null then 0 else 1 end
-        , p_row_end      => t_cur_row - 1
-        , p_sheet        => t_sheet
+        , p_row_end      => l_cur_row - 1
+        , p_sheet        => l_sheet
         );
     end if;
     --
     if p_table_style is not null and p_column_headers
     then
       set_table
-        ( p_column_start => t_col + 1
-        , p_column_end   => t_col + t_col_cnt
+        ( p_column_start => l_col + 1
+        , p_column_end   => l_col + l_col_cnt
         , p_row_start    => coalesce( p_row, 1 ) + case when p_title is null then 0 else 1 end
-        , p_row_end      => t_cur_row - 1
+        , p_row_end      => l_cur_row - 1
         , p_style        => p_table_style
-        , p_sheet        => t_sheet
+        , p_sheet        => l_sheet
         );
     end if;
     --
-    setUseXf( t_useXf );
+    setUseXf( l_useXf );
     return l_rows;
   exception
     when others
@@ -3090,10 +3291,11 @@ $END
       then
         dbms_sql.close_cursor( p_c );
       end if;
-      setUseXf( t_useXf );
+      setUseXf( l_useXf );
       return null;
   end query2sheet;
-  --
+
+  -- Convenience overload: accepts a SQL string, opens a cursor, and delegates.
   function query2sheet
     ( p_sql            varchar2
     , p_column_headers boolean     := true
@@ -3109,14 +3311,14 @@ $END
     )
   return number
   is
-    t_c integer;
-    t_r integer;
+    l_c integer;
+    l_r integer;
   begin
-    t_c := dbms_sql.open_cursor;
-    dbms_sql.parse( t_c, p_sql, dbms_sql.native );
-    t_r := dbms_sql.execute( t_c );
+    l_c := dbms_sql.open_cursor;
+    dbms_sql.parse( l_c, p_sql, dbms_sql.native );
+    l_r := dbms_sql.execute( l_c );
     return query2sheet
-             ( p_c              => t_c
+             ( p_c              => l_c
              , p_column_headers => p_column_headers
              , p_sheet          => p_sheet
              , p_UseXf          => p_UseXf
@@ -3129,7 +3331,8 @@ $END
              , p_table_style    => p_table_style
              );
   end;
-  --
+
+  -- Convenience overload: accepts a SYS_REFCURSOR, converts to DBMS_SQL, and delegates.
   function query2sheet
     ( p_rc             in out sys_refcursor
     , p_column_headers boolean     := true
@@ -3145,12 +3348,12 @@ $END
     )
   return number
   is
-    t_c integer;
-    t_r integer;
+    l_c integer;
+    l_r integer;
   begin
-    t_c := dbms_sql.to_cursor_number( p_rc );
+    l_c := dbms_sql.to_cursor_number( p_rc );
     return query2sheet
-             ( p_c              => t_c
+             ( p_c              => l_c
              , p_column_headers => p_column_headers
              , p_sheet          => p_sheet
              , p_UseXf          => p_UseXf
@@ -3163,7 +3366,8 @@ $END
              , p_table_style    => p_table_style
              );
   end;
-  --
+
+  -- Procedure overload (SQL string): ignores the return value.
   procedure query2sheet
     ( p_sql            varchar2
     , p_column_headers boolean     := true
@@ -3194,7 +3398,8 @@ $END
                  , p_table_style    => p_table_style
                  );
   end;
---
+
+  -- Procedure overload (SYS_REFCURSOR): ignores the return value.
   procedure query2sheet
     ( p_rc             in out sys_refcursor
     , p_column_headers boolean     := true
@@ -3225,13 +3430,22 @@ $END
                  , p_table_style    => p_table_style
                  );
   end;
-  --
+
+  --------------------------------------------------------------------------
+  -- Miscellaneous
+  --------------------------------------------------------------------------
+
+  -- Toggles XF style resolution on/off. When false, query2sheet uses
+  -- pre-resolved style strings for better performance on large data sets.
   procedure setUseXf( p_val boolean := true )
   is
   begin
     g_useXf := p_val;
   end;
---
+
+  -- Embeds an image (PNG, JPG, GIF, BMP) in a worksheet.
+  -- De-duplicates images by CRC hash.  Parses image headers to determine
+  -- width and height automatically.
   procedure add_image
     ( p_col pls_integer
     , p_row pls_integer
@@ -3372,7 +3586,8 @@ $END
     l_drawing.description := p_description;
     workbook.sheets( l_sheet ).drawings( workbook.sheets( l_sheet ).drawings.count + 1 ) := l_drawing;
   end add_image;
-  --
+
+  -- Returns the package version string.
   function get_version
   return varchar2
   is
