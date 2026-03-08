@@ -2326,9 +2326,12 @@ $END
     add1xml( p_excel, 'xl/workbook.xml', l_xxx );
   end build_workbook;
 
-  -- Static Office Theme XML (colors, fonts, effects).
-  -- Declared as a package-body constant to avoid rebuilding on every call.
-  c_THEME_XML constant clob := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+  -- Generates xl/theme/theme1.xml.
+  -- The theme XML is declared as a local constant to keep the large static
+  -- string out of the package-level declaration section.
+  procedure build_theme( p_excel in out nocopy blob )
+  is
+    c_THEME_XML constant clob := '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
 <a:themeElements>
 <a:clrScheme name="Office">
@@ -2612,9 +2615,6 @@ $END
 <a:extraClrSchemeLst/>
 </a:theme>';
 
-  -- Generates xl/theme/theme1.xml from the static constant.
-  procedure build_theme( p_excel in out nocopy blob )
-  is
   begin
     add1xml( p_excel, 'xl/theme/theme1.xml', c_THEME_XML );
   end build_theme;
